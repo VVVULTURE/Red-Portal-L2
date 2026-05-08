@@ -1,33 +1,26 @@
 {
-  "buildCommand": "vite build",
+  "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "installCommand": "npm install",
   "framework": "vite",
-
-  "rewrites": [
-    { "source": "/bare/:path*", "destination": "/api/bare" }
-  ],
-
+  "functions": {
+    "api/bare/[...path].js": {
+      "maxDuration": 10
+    }
+  },
   "headers": [
     {
       "source": "/(.*)",
       "headers": [
-        { "key": "Access-Control-Allow-Origin",  "value": "*"       },
-        { "key": "X-Content-Type-Options",        "value": "nosniff" },
-        { "key": "Cross-Origin-Opener-Policy",    "value": "same-origin-allow-popups" },
-        { "key": "Cross-Origin-Embedder-Policy",  "value": "unsafe-none" }
+        { "key": "Access-Control-Allow-Origin",  "value": "*" },
+        { "key": "X-Content-Type-Options",        "value": "nosniff" }
       ]
     },
     {
       "source": "/uv/uv.sw.js",
       "headers": [
-        { "key": "Service-Worker-Allowed", "value": "/" }
-      ]
-    },
-    {
-      "source": "/service/(.*)",
-      "headers": [
-        { "key": "Cache-Control", "value": "no-store" }
+        { "key": "Service-Worker-Allowed", "value": "/" },
+        { "key": "Cache-Control",          "value": "no-store" }
       ]
     }
   ]

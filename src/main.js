@@ -47,6 +47,9 @@ function renderGrid(containerId, list) {
     card.href = game.url;
     card.target = '_blank';
     card.rel = 'noopener';
+    // Store name + url for the modal
+    card.dataset.name = game.name;
+    card.dataset.url  = game.url;
     card.style.setProperty('--band', band);
     card.style.animationDelay = `${i * 30}ms`;
     card.innerHTML = `
@@ -113,99 +116,21 @@ const LOADING_PAGE = `<!DOCTYPE html><html><head><meta charset="UTF-8">
 </style></head>
 <body><div class="ring"></div><p>Loading game…</p></body></html>`;
 
-// ── Ultraviolet proxy helpers ────────────────────────────────────────
-//
-// UV works in three pieces:
-//   1. uv.bundle.js  — sets the global `Ultraviolet` object (loaded via <script>)
-//   2. uv.config.js  — sets `self.__uv$config` (loaded via <script> after bundle)
-//   3. uv.sw.js      — the service worker, registered below with scope /service/
-//
-// When a fetch() fails (CORS / firewall), we route the popup to:
-//   /service/<xor-encoded-url>
-// The service worker intercepts that, proxies it through /bare/ (our Vercel
-// serverless bare server), and returns the real response — bypassing CORS.
-
-let uvReady = false; // true once the SW is active and controlling the page
-
-async function registerUV() {
-  if (!('serviceWorker' in navigator)) {
-    console.warn('[UV] Service workers not supported');
-    return;
-  }
-  try {
-    // Scope is /service/ so the SW only intercepts UV-proxied requests,
-    // leaving all other page fetches completely unaffected.
-    const reg = await navigator.serviceWorker.register('/uv/uv.sw.js', {
-      scope: '/service/',
-    });
-
-    // Wait for an active worker (handles first-load case where SW hasn't
-    // activated yet — typically resolves in < 200 ms on subsequent loads).
-    await new Promise(resolve => {
-      if (reg.active) { resolve(); return; }
-      const sw = reg.installing || reg.waiting;
-      if (sw) sw.addEventListener('statechange', e => {
-        if (e.target.state === 'activated') resolve();
-      });
-      // Timeout safety — we still fall back to direct navigate if SW is slow
-      setTimeout(resolve, 3000);
-    });
-
-    uvReady = true;
-    console.log('[UV] Service worker ready');
-  } catch (err) {
-    console.warn('[UV] SW registration failed:', err);
-  }
-}
-
-/**
- * Returns the UV-proxied URL for a given target, or null if UV isn't ready.
- * Requires window.__uv$config (set by uv.config.js) to be present.
- */
-function getUVUrl(targetUrl) {
-  try {
-    const cfg = window.__uv$config;
-    if (!uvReady || !cfg) return null;
-    return cfg.prefix + cfg.encodeUrl(targetUrl);
-  } catch {
-    return null;
-  }
-}
-
-// ── THE FIX: open popup synchronously, fetch asynchronously ─────────
-//
-// Three-stage cascade (game always opens):
-//
-//   Stage 1 — Direct fetch + blob inject
-//     ✓ CORS allowed  →  inject <base> tag, serve as blob URL (cleanest)
-//
-//   Stage 2 — UV proxy (Ultraviolet service worker via /bare/)
-//     CORS blocked, UV ready  →  navigate popup to /service/<encoded-url>
-//     The SW proxies through our own Vercel bare server. No popup re-open
-//     needed — we just change location.href on the already-open popup.
-//
-//   Stage 3 — Direct navigate
-//     UV not ready / bare server down  →  navigate popup directly to the URL.
-//     Game still opens; assets that are cross-origin may not load but it's
-//     the best we can do without a proxy.
-//
+// ── Direct fetch open (original approach) ────────────────────────────
 function openGame(url) {
   if (!url) { toast('No URL set for this game.', 'error'); return; }
   if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
 
-  // SYNC — open popup tied to this user gesture BEFORE any await/then.
   const win = window.open('about:blank', '_blank');
   if (!win) {
     toast('Popup blocked — please allow popups for this site.', 'error');
     return;
   }
 
-  // Fill popup immediately so it looks alive while we work in background.
   win.document.open();
   win.document.write(LOADING_PAGE);
   win.document.close();
 
-  // Stage 1 — direct fetch with 12-second timeout
   const controller = new AbortController();
   const tid = setTimeout(() => controller.abort(), 12_000);
 
@@ -216,29 +141,172 @@ function openGame(url) {
       return res.text();
     })
     .then(html => {
-      // Stage 1 success: inject <base> so relative assets resolve correctly,
-      // then serve the whole page as a blob URL in the already-open popup.
-      const base = url.replace(/([^/]*)(\?.*)?$/, '');
+      const base  = url.replace(/([^/]*)(\?.*)?$/, '');
       const fixed = html.replace(/<head([^>]*)>/i, (m, a) => `<head${a}><base href="${base}">`);
       const blob  = new Blob([fixed], { type: 'text/html' });
       if (!win.closed) win.location.href = URL.createObjectURL(blob);
     })
     .catch(() => {
       clearTimeout(tid);
-      if (win.closed) return;
-
-      // Stage 2 — UV proxy
-      const uvUrl = getUVUrl(url);
-      if (uvUrl) {
-        console.log('[UV] Proxying via UV:', url);
-        win.location.href = uvUrl;
-        return;
-      }
-
-      // Stage 3 — bare direct navigate
-      console.log('[UV] Falling back to direct navigate:', url);
-      win.location.href = url;
+      // No silent fallback — the modal already gave the user the choice.
+      // If fetch fails, close the loading popup and toast an error.
+      if (!win.closed) win.close();
+      toast('Fetch failed — try opening via Proxy instead.', 'error');
     });
+}
+
+// ── Ultraviolet proxy open ───────────────────────────────────────────
+//
+// Registers the UV service worker (if not already active), encodes the
+// target URL with XOR, then opens /uv/service/<encoded> in a new tab.
+// The SW intercepts that navigation and tunnels it through /api/bare/
+// (our Vercel serverless function) so the browser never sees a CORS error.
+//
+async function openViaProxy(url) {
+  if (!url) { toast('No URL for this game.', 'error'); return; }
+  if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+
+  // UV scripts must have loaded
+  if (typeof __uv$config === 'undefined') {
+    toast('Proxy unavailable — UV files not found. Run npm run copy-uv.', 'error');
+    return;
+  }
+
+  if (!('serviceWorker' in navigator)) {
+    toast('Your browser does not support service workers.', 'error');
+    return;
+  }
+
+  // Open the popup SYNC (tied to the click event) so browsers don't block it
+  const win = window.open('about:blank', '_blank');
+  if (!win) {
+    toast('Popup blocked — please allow popups for this site.', 'error');
+    return;
+  }
+
+  win.document.open();
+  win.document.write(LOADING_PAGE);
+  win.document.close();
+
+  try {
+    // Register SW if not yet controlling this page
+    if (!navigator.serviceWorker.controller) {
+      await navigator.serviceWorker.register('/uv/uv.sw.js', {
+        scope: '/uv/service/',
+      });
+
+      // Wait until the SW is active and controlling
+      await new Promise(resolve => {
+        if (navigator.serviceWorker.controller) return resolve();
+        navigator.serviceWorker.addEventListener(
+          'controllerchange', resolve, { once: true }
+        );
+        // Timeout fallback — proceed anyway after 3 s
+        setTimeout(resolve, 3000);
+      });
+    }
+
+    const encoded  = __uv$config.encodeUrl(url);
+    const proxyUrl = __uv$config.prefix + encoded;
+
+    if (!win.closed) win.location.href = proxyUrl;
+  } catch (err) {
+    console.error('[proxy]', err);
+    if (!win.closed) win.close();
+    toast('Proxy error — ' + err.message, 'error');
+  }
+}
+
+// ── Game open modal ──────────────────────────────────────────────────
+//
+// Shows a choice dialog instead of immediately opening the game.
+// The user picks "Fetch" (client-side blob) or "Proxy" (Ultraviolet SW).
+//
+function showOpenModal(game) {
+  // Remove any existing modal
+  document.getElementById('openModal')?.remove();
+
+  const proxyAvailable = typeof __uv$config !== 'undefined';
+
+  const overlay = document.createElement('div');
+  overlay.id = 'openModal';
+  overlay.className = 'modal-overlay';
+  overlay.setAttribute('role', 'dialog');
+  overlay.setAttribute('aria-modal', 'true');
+  overlay.setAttribute('aria-label', `Open ${game.name}`);
+
+  overlay.innerHTML = `
+    <div class="modal" id="openModalBox">
+      <button class="modal-close" id="modalClose" aria-label="Close">✕</button>
+
+      <div class="modal-icon">${getIcon(game.name)}</div>
+      <h3 class="modal-title">${game.name}</h3>
+      <p class="modal-sub">How would you like to open this game?</p>
+
+      <div class="modal-actions">
+
+        <button class="modal-opt" id="btnModalFetch">
+          <span class="modal-opt-left">
+            <span class="modal-opt-icon">🔗</span>
+            <span class="modal-opt-text">
+              <strong>Fetch &amp; Open</strong>
+              <span class="modal-opt-desc">Grabs the page directly — fast, but may fail on CORS-locked sites</span>
+            </span>
+          </span>
+          <span class="modal-opt-arrow">›</span>
+        </button>
+
+        <button class="modal-opt modal-opt-proxy${proxyAvailable ? '' : ' modal-opt-disabled'}"
+                id="btnModalProxy"
+                ${proxyAvailable ? '' : 'disabled title="UV files not found — run npm run copy-uv"'}>
+          <span class="modal-opt-left">
+            <span class="modal-opt-icon">🔒</span>
+            <span class="modal-opt-text">
+              <strong>Open via Proxy</strong>
+              <span class="modal-opt-desc">${
+                proxyAvailable
+                  ? 'Routes through Ultraviolet — works on CORS-blocked games'
+                  : 'Ultraviolet not found — run npm run copy-uv first'
+              }</span>
+            </span>
+          </span>
+          <span class="modal-opt-arrow">›</span>
+        </button>
+
+      </div>
+    </div>`;
+
+  document.body.appendChild(overlay);
+
+  // Animate in
+  requestAnimationFrame(() =>
+    requestAnimationFrame(() => overlay.classList.add('show'))
+  );
+
+  // Close helpers
+  const close = () => {
+    overlay.classList.remove('show');
+    setTimeout(() => overlay.remove(), 260);
+  };
+
+  overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+  document.getElementById('modalClose').addEventListener('click', close);
+
+  document.addEventListener('keydown', function onKey(e) {
+    if (e.key === 'Escape') { close(); document.removeEventListener('keydown', onKey); }
+  });
+
+  // Button actions
+  document.getElementById('btnModalFetch').addEventListener('click', () => {
+    close();
+    openGame(game.url);
+  });
+
+  document.getElementById('btnModalProxy').addEventListener('click', () => {
+    if (!proxyAvailable) return;
+    close();
+    openViaProxy(game.url);
+  });
 }
 
 // ── Navigation ───────────────────────────────────────────────────────
@@ -279,7 +347,7 @@ function executeFile() {
   reader.readAsText(file);
 }
 
-// ── Website Fetcher (same 3-stage cascade) ──────────────────────────
+// ── Website Fetcher ──────────────────────────────────────────────────
 function fetchSite() {
   const input  = document.getElementById('urlInput');
   const status = document.getElementById('fetchStatus');
@@ -287,7 +355,6 @@ function fetchSite() {
   if (!url) { status.textContent = 'Enter a URL.'; return; }
   if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
 
-  // SYNC open
   const win = window.open('about:blank', '_blank');
   if (!win) {
     status.textContent = 'Popup blocked! Allow popups to use the fetcher.';
@@ -306,7 +373,6 @@ function fetchSite() {
   fetch(url, { signal: controller.signal })
     .then(res => { if (!res.ok) throw new Error(`HTTP ${res.status}`); return res.text(); })
     .then(html => {
-      // Stage 1 success
       const base  = url.replace(/([^/]*)(\?.*)?$/, '');
       const fixed = html.replace(/<head([^>]*)>/i, (m, a) => `<head${a}><base href="${base}">`);
       const blob  = new Blob([fixed], { type: 'text/html' });
@@ -314,29 +380,28 @@ function fetchSite() {
       status.textContent = 'Opened!';
     })
     .catch(() => {
-      if (win.closed) return;
-
-      // Stage 2 — UV proxy
-      const uvUrl = getUVUrl(url);
-      if (uvUrl) {
-        console.log('[UV] Fetcher proxying via UV:', url);
-        win.location.href = uvUrl;
-        status.textContent = 'Proxying through UV…';
-      } else {
-        // Stage 3 — direct
-        win.location.href = url;
-        status.textContent = 'Fetch blocked — navigated directly instead.';
-      }
+      if (!win.closed) win.location.href = url;
+      status.textContent = 'Fetch blocked — navigated directly instead.';
     })
     .finally(() => setTimeout(() => { status.textContent = ''; }, 4000));
 }
 
+// ── Service worker pre-registration (improves proxy first-launch speed) ─
+async function registerServiceWorker() {
+  if (!('serviceWorker' in navigator)) return;
+  if (typeof __uv$config === 'undefined') return; // UV not available
+  try {
+    await navigator.serviceWorker.register('/uv/uv.sw.js', {
+      scope: '/uv/service/',
+    });
+  } catch (e) {
+    // Non-fatal — SW will be registered on demand when proxy is used
+    console.warn('[Red Portal] UV SW pre-registration skipped:', e.message);
+  }
+}
+
 // ── Boot ─────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
-  // Register UV service worker in the background — doesn't block render.
-  // By the time a user clicks a game card, it will almost certainly be ready.
-  registerUV();
-
   // Render game grids
   renderGrid('gamesGrid',     games);
   renderGrid('preLaunchGrid', testingGames);
@@ -353,17 +418,17 @@ document.addEventListener('DOMContentLoaded', () => {
     showSection(link.dataset.section);
   });
 
-  // Game grid click delegation
+  // Game grid click → show modal instead of opening immediately
   ['gamesGrid', 'preLaunchGrid', 'proxiesGrid'].forEach(id => {
     document.getElementById(id)?.addEventListener('click', e => {
       const card = e.target.closest('.game-card');
       if (!card) return;
       e.preventDefault();
-      openGame(card.href);
+      showOpenModal({ name: card.dataset.name, url: card.dataset.url });
     });
   });
 
-  // Executor buttons
+  // Executor
   document.getElementById('btnRunHtml')?.addEventListener('click', executeTyped);
   document.getElementById('btnOpenFile')?.addEventListener('click', executeFile);
 
@@ -380,4 +445,7 @@ document.addEventListener('DOMContentLoaded', () => {
       '_blank'
     );
   });
+
+  // Pre-register UV service worker so first proxy click is instant
+  registerServiceWorker();
 });

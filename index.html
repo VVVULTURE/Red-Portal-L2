@@ -8,12 +8,13 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 
   <!--
-    uv.bundle.js must load BEFORE uv.config.js because the config references
-    the `Ultraviolet` global that the bundle exposes.
-    Both must load before main.js registers the service worker.
+    Ultraviolet: bundle defines the global `Ultraviolet` object,
+    config uses it to set self.__uv$config.
+    onerror: silently warns so the page doesn't hard-crash if UV files
+    haven't been copied yet (run `npm run copy-uv` / `npm run build`).
   -->
-  <script src="/uv/uv.bundle.js" defer></script>
-  <script src="/uv/uv.config.js" defer></script>
+  <script src="/uv/uv.bundle.js" onerror="console.warn('[Red Portal] UV bundle not found – run npm run copy-uv')"></script>
+  <script src="/uv/uv.config.js" onerror="console.warn('[Red Portal] UV config not found – run npm run copy-uv')"></script>
 </head>
 <body>
 
