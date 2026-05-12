@@ -891,61 +891,149 @@ function bUpdateNav() {
   $btnFwd.disabled  = bState.index >= bState.history.length - 1;
 }
 
-/* Rewrite HTML: proxy assets, intercept link clicks via postMessage */
+/* Rewrite HTML: proxy assets + inject shim that intercepts fetch/XHR/navigation */
 function rewriteForProxy(html, baseUrl) {
   const w = state.workerUrl.replace(/\/$/,'');
   const doc = new DOMParser().parseFromString(html, 'text/html');
 
-  function abs(v) { try { return new URL(v, baseUrl).href; } catch { return null; } }
+  function abs(v) {
+    if (!v) return null;
+    if (/^(data:|blob:|javascript:|#|mailto:|tel:)/.test(v.trim())) return null;
+    try { return new URL(v.trim(), baseUrl).href; } catch { return null; }
+  }
 
-  // proxy asset URLs
+  // Proxy all static asset URLs so images/styles/scripts load through the worker
   doc.querySelectorAll('img[src],video[src],audio[src],source[src],track[src]').forEach(el => {
     const a = abs(el.getAttribute('src'));
-    if (a && !/^(data|blob):/.test(a)) el.src = `${w}?url=${encodeURIComponent(a)}`;
+    if (a) el.setAttribute('src', `${w}?url=${encodeURIComponent(a)}`);
   });
   doc.querySelectorAll('script[src]').forEach(el => {
     const a = abs(el.getAttribute('src'));
-    if (a && !/^(data|blob):/.test(a)) el.setAttribute('src', `${w}?url=${encodeURIComponent(a)}`);
+    if (a) el.setAttribute('src', `${w}?url=${encodeURIComponent(a)}`);
   });
   doc.querySelectorAll('link[href]').forEach(el => {
     const a = abs(el.getAttribute('href'));
-    if (a && !/^(data|blob|#):/.test(a)) el.setAttribute('href', `${w}?url=${encodeURIComponent(a)}`);
+    if (a) el.setAttribute('href', `${w}?url=${encodeURIComponent(a)}`);
+  });
+  // srcset (responsive images)
+  doc.querySelectorAll('[srcset]').forEach(el => {
+    const rewritten = el.getAttribute('srcset').split(',').map(part => {
+      const [u, ...desc] = part.trim().split(/\s+/);
+      const a = abs(u);
+      return a ? [`${w}?url=${encodeURIComponent(a)}`, ...desc].join(' ') : part;
+    }).join(', ');
+    el.setAttribute('srcset', rewritten);
   });
 
-  // intercept anchor clicks
+  // Mark anchor hrefs for the shim to intercept (keep href so right-click/preview works)
   doc.querySelectorAll('a[href]').forEach(el => {
-    const href = el.getAttribute('href');
-    if (!href || href.startsWith('#') || href.startsWith('javascript:')) return;
-    const a = abs(href);
+    const a = abs(el.getAttribute('href'));
     if (!a) return;
     el.setAttribute('data-pnav', a);
-    el.removeAttribute('href');
-    el.style.cursor = 'pointer';
   });
 
-  // intercept form submits
-  doc.querySelectorAll('form[action]').forEach(el => {
-    const a = abs(el.getAttribute('action'));
-    if (a) { el.setAttribute('data-pform', a); el.removeAttribute('action'); }
+  // Mark form actions for the shim
+  doc.querySelectorAll('form').forEach(el => {
+    const raw = el.getAttribute('action') || baseUrl;
+    const a = abs(raw) || baseUrl;
+    el.setAttribute('data-pform', a);
   });
 
-  // inject listener
-  const s = doc.createElement('script');
-  s.textContent = `(function(){
-    document.addEventListener('click',function(e){
-      var el=e.target.closest('[data-pnav]');
-      if(el){e.preventDefault();window.parent.postMessage({type:'rpNav',url:el.getAttribute('data-pnav')},'*');}
-    },true);
-    document.addEventListener('submit',function(e){
-      var f=e.target,a=f.getAttribute('data-pform');
-      if(a){e.preventDefault();
-        var m=(f.method||'get').toLowerCase();
-        if(m==='get'){var q=new URLSearchParams(new FormData(f)).toString();
-          window.parent.postMessage({type:'rpNav',url:a+(q?'?'+q:'')},'*');}
+  // Build the shim — runs before the page's own JS
+  // Intercepts: fetch, XHR, link clicks, form submits, window.open
+  const shim = doc.createElement('script');
+  // baseUrl and worker URL are baked in at rewrite time so the shim is self-contained
+  shim.textContent = `(function(){
+  var W=${JSON.stringify(w)};
+  var BASE=${JSON.stringify(baseUrl)};
+
+  /* Resolve any URL (relative or absolute) through the worker */
+  function px(u) {
+    if (!u || typeof u !== 'string') return u;
+    u = u.trim();
+    if (/^(data:|blob:|javascript:|#|mailto:|tel:)/.test(u)) return u;
+    try {
+      var abs = new URL(u, BASE).href;
+      if (abs.startsWith(W)) return abs;        // already proxied
+      return W + '?url=' + encodeURIComponent(abs);
+    } catch(e) { return u; }
+  }
+
+  /* ── fetch ── */
+  var _fetch = window.fetch;
+  window.fetch = function(resource, opts) {
+    if (typeof resource === 'string') resource = px(resource);
+    else if (resource instanceof Request) {
+      try { resource = new Request(px(resource.url), resource); } catch(e){}
+    }
+    return _fetch.call(window, resource, opts);
+  };
+
+  /* ── XMLHttpRequest ── */
+  var _open = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(method, url) {
+    var rest = Array.prototype.slice.call(arguments, 2);
+    return _open.apply(this, [method, px(url)].concat(rest));
+  };
+
+  /* ── window.open ── */
+  var _wopen = window.open;
+  window.open = function(url, target, features) {
+    window.parent.postMessage({type:'rpNav', url: new URL(url||'', BASE).href}, '*');
+    return null;
+  };
+
+  /* ── Link click → postMessage to parent ── */
+  document.addEventListener('click', function(e) {
+    var el = e.target.closest('a[data-pnav]');
+    if (!el) return;
+    var href = el.getAttribute('data-pnav');
+    if (!href || href.startsWith('#')) return;
+    e.preventDefault();
+    window.parent.postMessage({type:'rpNav', url: href}, '*');
+  }, true);
+
+  /* ── Form submit → postMessage to parent ── */
+  document.addEventListener('submit', function(e) {
+    var f = e.target;
+    var action = f.getAttribute('data-pform') || BASE;
+    e.preventDefault();
+    var method = (f.method || 'get').toLowerCase();
+    if (method === 'get') {
+      var qs = new URLSearchParams(new FormData(f)).toString();
+      window.parent.postMessage({type:'rpNav', url: action + (qs ? '?' + qs : '')}, '*');
+    } else {
+      /* POST — fetch it and navigate to result */
+      var body = new FormData(f);
+      fetch(px(action), {method:'POST', body: body})
+        .then(function(r){ return r.text(); })
+        .then(function(html){
+          window.parent.postMessage({type:'rpHtml', url: action, html: html}, '*');
+        });
+    }
+  }, true);
+
+  /* ── history.pushState / replaceState navigation ── */
+  function wrapHistory(method) {
+    var orig = history[method];
+    history[method] = function(state, title, url) {
+      orig.apply(history, arguments);
+      if (url) {
+        try {
+          var abs = new URL(url, BASE).href;
+          window.parent.postMessage({type:'rpUrlChange', url: abs}, '*');
+        } catch(e){}
       }
-    },true);
-  })();`;
-  (doc.head || doc.body).appendChild(s);
+    };
+  }
+  wrapHistory('pushState');
+  wrapHistory('replaceState');
+
+})();`;
+
+  // Inject shim as the very first child of <head>
+  const head = doc.head || doc.documentElement;
+  head.insertBefore(shim, head.firstChild);
 
   return '<!DOCTYPE html>' + doc.documentElement.outerHTML;
 }
@@ -988,9 +1076,32 @@ async function browserNavigate(url) {
   }
 }
 
-// in-iframe link navigation via postMessage
+// Messages from the injected shim inside the iframe
 window.addEventListener('message', e => {
-  if (e.data && e.data.type === 'rpNav' && e.data.url) browserNavigate(e.data.url);
+  if (!e.data) return;
+  const { type, url, html } = e.data;
+
+  if (type === 'rpNav' && url) {
+    // Link click or GET form submit → navigate normally
+    browserNavigate(url);
+
+  } else if (type === 'rpHtml' && html) {
+    // POST form result returned as HTML — render it in place
+    const rewritten = rewriteForProxy(html, url || bState.current);
+    $frame.srcdoc = rewritten;
+    if (url) { $urlBar.value = url; bState.current = url; }
+
+  } else if (type === 'rpUrlChange' && url) {
+    // history.pushState / replaceState fired inside the frame — update bar only
+    $urlBar.value = url;
+    bState.current = url;
+    if (bState.history[bState.index] !== url) {
+      bState.history = bState.history.slice(0, bState.index + 1);
+      bState.history.push(url);
+      bState.index = bState.history.length - 1;
+      bUpdateNav();
+    }
+  }
 });
 
 document.getElementById('btnGo').addEventListener('click', () => {
