@@ -253,14 +253,26 @@
     .status.err { color: #f87171; }
 
     /* ── PROXY BROWSER ── */
+
+    /*
+     * Grid layout: toolbar row is auto height, viewport row takes the rest.
+     * This is the most reliable way to give an iframe a known height.
+     */
     .browser-shell {
-      background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
-      overflow: hidden; box-shadow: var(--card-shadow); display: flex; flex-direction: column;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      box-shadow: var(--card-shadow);
+      display: grid;
+      grid-template-rows: auto 1fr;
+      height: 82vh;
     }
+
     .browser-toolbar {
       display: flex; align-items: center; gap: .4rem; padding: .55rem .75rem;
-      background: var(--bg); border-bottom: 1px solid var(--border); flex-shrink: 0;
+      background: var(--bg); border-bottom: 1px solid var(--border);
     }
+
     .browser-url-wrap { flex: 1; position: relative; }
     .browser-url-wrap svg {
       position: absolute; left: .7rem; top: 50%; transform: translateY(-50%);
@@ -276,8 +288,18 @@
     #browserUrl:focus { border-color: var(--red); box-shadow: var(--glow-sm); }
     #browserUrl::placeholder { color: var(--muted); }
 
-    .browser-viewport { position: relative; flex: 1; min-height: 70vh; background: #fff; }
-    #browserFrame { width: 100%; height: 100%; min-height: 70vh; border: none; display: block; }
+    /* The grid cell gives this div an explicit height, so height:100% works on children */
+    .browser-viewport {
+      position: relative;
+      overflow: hidden;
+    }
+    /* Frame fills its parent div exactly */
+    #browserFrame {
+      width: 100%;
+      height: 100%;
+      border: none;
+      display: block;
+    }
 
     .browser-loading {
       position: absolute; inset: 0; background: var(--bg);
@@ -289,7 +311,7 @@
       width: 36px; height: 36px; border: 3px solid var(--border);
       border-top-color: var(--red); border-radius: 50%; animation: spin .7s linear infinite;
     }
-    @keyframes spin { to{transform:rotate(360deg)} }
+    @keyframes spin { to { transform: rotate(360deg); } }
     .browser-loading p { font-family: 'Share Tech Mono', monospace; font-size: .82rem; color: var(--muted); }
 
     .browser-welcome {
@@ -301,11 +323,15 @@
     .browser-welcome p { font-size: 1rem; font-weight: 600; letter-spacing: .06em; }
     .browser-welcome small { font-size: .8rem; opacity: .7; }
 
+    /* Fullscreen — same grid layout, just pinned to the full viewport */
     .browser-shell.fs {
-      position: fixed; inset: 0; z-index: 9999; border-radius: 0; border: none;
+      position: fixed;
+      inset: 0;
+      z-index: 9999;
+      border-radius: 0;
+      border: none;
+      height: 100vh;
     }
-    .browser-shell.fs .browser-viewport,
-    .browser-shell.fs #browserFrame { min-height: unset; height: 100%; }
 
     /* ── WORKER CONFIG (credits) ── */
     .worker-config-card { margin-top: 2rem; border-top: 1px solid var(--border); padding-top: 1.5rem; }
@@ -393,25 +419,54 @@
     </ol>
     <pre>export default {
   async fetch(request) {
-    const url = new URL(request.url);
+    const url    = new URL(request.url);
     const target = url.searchParams.get("url");
+
     if (!target) return new Response("Missing ?url=", { status: 400 });
-    const res = await fetch(target, {
-      headers: { "User-Agent": request.headers.get("User-Agent") || "Mozilla/5.0" },
-      redirect: "follow",
-    });
-    const body = await res.arrayBuffer();
-    const ct = res.headers.get("content-type") || "text/html";
-    return new Response(body, {
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: cors() });
+    }
+
+    let res;
+    try {
+      res = await fetch(target, {
+        method: request.method,
+        headers: {
+          "User-Agent":      request.headers.get("User-Agent") ||
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+          "Accept":          request.headers.get("Accept") ||
+            "text/html,application/xhtml+xml,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9",
+          "Referer":         new URL(target).origin + "/",
+        },
+        body: ["GET","HEAD"].includes(request.method) ? undefined : request.body,
+        redirect: "follow",
+      });
+    } catch (e) {
+      return new Response("Fetch failed: " + e.message,
+        { status: 502, headers: { ...cors(), "content-type": "text/plain" } });
+    }
+
+    return new Response(res.body, {
       status: res.status,
       headers: {
-        "content-type": ct,
-        "access-control-allow-origin": "*",
-        "x-frame-options": "ALLOWALL",
+        ...cors(),
+        "content-type": res.headers.get("content-type") || "text/html",
       },
     });
   },
-};</pre>
+};
+
+function cors() {
+  return {
+    "access-control-allow-origin":  "*",
+    "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
+    "access-control-allow-headers": "*",
+    "x-frame-options":              "ALLOWALL",
+    "content-security-policy":      "",
+  };
+}</pre>
     <div class="field">
       <label class="section-label" for="modalWorkerInput">Your Worker URL</label>
       <div class="worker-url-row">
@@ -895,19 +950,27 @@ function rewriteForProxy(html, baseUrl) {
   return '<!DOCTYPE html>' + doc.documentElement.outerHTML;
 }
 
+/* Resolve raw bar input → full URL or startpage search */
+function resolveInput(raw) {
+  const s = raw.trim();
+  if (!s) return null;
+  if (/^https?:\/\//i.test(s)) return s;                      // already a URL
+  if (!s.includes(' ') && /\.\w{2,}/.test(s)) return 'https://' + s; // looks like domain
+  return 'https://www.startpage.com/do/dsearch?query=' + encodeURIComponent(s); // search
+}
+
 async function browserNavigate(url) {
   if (!url) return;
-  if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
   bState.current = url;
   $urlBar.value  = url;
   $welcome.style.display = 'none';
-  bSetLoading(true, 'Loading ' + url + '…');
+  bSetLoading(true, 'Loading…');
   $bStatus.textContent = '';
   $bStatus.className = 'status';
   try {
     const {html, finalUrl} = await smartFetch(url);
     const rewritten = rewriteForProxy(html, finalUrl);
-    // push history
+    // push history only if different from current entry
     if (bState.history[bState.index] !== url) {
       bState.history = bState.history.slice(0, bState.index + 1);
       bState.history.push(url);
@@ -930,26 +993,58 @@ window.addEventListener('message', e => {
   if (e.data && e.data.type === 'rpNav' && e.data.url) browserNavigate(e.data.url);
 });
 
-document.getElementById('btnGo').addEventListener('click', () => browserNavigate($urlBar.value.trim()));
-$urlBar.addEventListener('keydown', e => { if (e.key === 'Enter') browserNavigate($urlBar.value.trim()); });
+document.getElementById('btnGo').addEventListener('click', () => {
+  const resolved = resolveInput($urlBar.value);
+  if (resolved) browserNavigate(resolved);
+});
+$urlBar.addEventListener('keydown', e => {
+  if (e.key === 'Enter') {
+    const resolved = resolveInput($urlBar.value);
+    if (resolved) browserNavigate(resolved);
+  }
+});
 $btnBack.addEventListener('click', () => { if (bState.index > 0) browserNavigate(bState.history[--bState.index]); });
 $btnFwd.addEventListener('click',  () => { if (bState.index < bState.history.length-1) browserNavigate(bState.history[++bState.index]); });
 document.getElementById('btnRefresh').addEventListener('click', () => { if (bState.current) browserNavigate(bState.current); });
 
-// fullscreen
+// fullscreen — native Fullscreen API, CSS class as fallback
 const $shell = document.getElementById('browserShell');
 const $fsBtn  = document.getElementById('btnFullscreen');
-$fsBtn.addEventListener('click', () => {
-  const on = $shell.classList.toggle('fs');
+
+function enterFs() {
+  if ($shell.requestFullscreen) $shell.requestFullscreen().catch(() => cssFallback(true));
+  else if ($shell.webkitRequestFullscreen) $shell.webkitRequestFullscreen();
+  else cssFallback(true);
+}
+function exitFs() {
+  if (document.exitFullscreen && document.fullscreenElement) document.exitFullscreen();
+  else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+  cssFallback(false);
+}
+function cssFallback(on) {
+  $shell.classList.toggle('fs', on);
+  document.body.style.overflow = on ? 'hidden' : '';
+}
+function updateFsBtn(on) {
   $fsBtn.textContent = on ? '✕' : '⛶';
   $fsBtn.title       = on ? 'Exit Fullscreen' : 'Fullscreen';
-  document.body.style.overflow = on ? 'hidden' : '';
+}
+
+$fsBtn.addEventListener('click', () => {
+  const isFs = !!document.fullscreenElement || $shell.classList.contains('fs');
+  isFs ? exitFs() : enterFs();
+  updateFsBtn(!isFs);
+});
+
+// native fullscreen events keep button in sync
+document.addEventListener('fullscreenchange', () => {
+  const on = !!document.fullscreenElement;
+  cssFallback(on);
+  updateFsBtn(on);
 });
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape' && $shell.classList.contains('fs')) {
-    $shell.classList.remove('fs');
-    $fsBtn.textContent = '⛶';
-    document.body.style.overflow = '';
+  if (e.key === 'Escape') {
+    if ($shell.classList.contains('fs')) { cssFallback(false); updateFsBtn(false); }
   }
 });
 
