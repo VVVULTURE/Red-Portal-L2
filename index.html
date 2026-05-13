@@ -944,8 +944,11 @@ function rewriteForProxy(html, baseUrl) {
   const shim = doc.createElement('script');
   // baseUrl and worker URL are baked in at rewrite time so the shim is self-contained
   shim.textContent = `(function(){
-  var W=${JSON.stringify(w)};
-  var BASE=${JSON.stringify(baseUrl)};
+  var W    = ${JSON.stringify(w)};
+  var BASE = ${JSON.stringify(baseUrl)};
+
+  /* Parse the real page URL once so all getters below are fast */
+  var _baseU = new URL(BASE);
 
   /* Resolve any URL (relative or absolute) through the worker */
   function px(u) {
@@ -954,36 +957,140 @@ function rewriteForProxy(html, baseUrl) {
     if (/^(data:|blob:|javascript:|#|mailto:|tel:)/.test(u)) return u;
     try {
       var abs = new URL(u, BASE).href;
-      if (abs.startsWith(W)) return abs;        // already proxied
+      if (abs.startsWith(W)) return abs;
       return W + '?url=' + encodeURIComponent(abs);
     } catch(e) { return u; }
   }
+
+  /* ── Spoof window.location to return the real page URL ──────────────────────
+     Inside a srcdoc iframe, location.href / location.search etc. return the
+     blob/srcdoc URL. Startpage reads location.search to get the current query
+     before building a new URL — if it reads "" it navigates with no params.
+     We override every location property getter at the prototype level so the
+     page thinks it's running at BASE. */
+  try {
+    var _lp = Object.getPrototypeOf(window.location);
+    var _hd = Object.getOwnPropertyDescriptor(_lp, 'href');
+
+    /* Spoof getters for every useful Location property */
+    var _spoofs = {
+      href:     function() { return BASE; },
+      origin:   function() { return _baseU.origin; },
+      protocol: function() { return _baseU.protocol; },
+      host:     function() { return _baseU.host; },
+      hostname: function() { return _baseU.hostname; },
+      port:     function() { return _baseU.port; },
+      pathname: function() { return _baseU.pathname; },
+      search:   function() { return _baseU.search; },
+      hash:     function() { return _baseU.hash; },
+    };
+    Object.keys(_spoofs).forEach(function(prop) {
+      try {
+        var d = Object.getOwnPropertyDescriptor(_lp, prop) || {};
+        Object.defineProperty(_lp, prop, {
+          get: _spoofs[prop],
+          /* Keep the setter for href so our navigation intercept below works */
+          set: d.set,
+          configurable: true,
+        });
+      } catch(e) {}
+    });
+
+    /* Intercept href setter — navigation via assignment */
+    if (_hd && _hd.set) {
+      Object.defineProperty(_lp, 'href', {
+        get: _spoofs.href,
+        set: function(v) {
+          try {
+            var a = new URL(String(v), BASE).href;
+            if (/^(blob:|about:|data:|javascript:)/.test(a)) { _hd.set.call(this, v); return; }
+            window.parent.postMessage({type:'rpNav', url: a}, '*');
+          } catch(e) { _hd.set.call(this, v); }
+        },
+        configurable: true,
+      });
+    }
+
+    /* Intercept assign() and replace() */
+    var _oa = _lp.assign;
+    _lp.assign = function(v) {
+      try { window.parent.postMessage({type:'rpNav', url: new URL(String(v), BASE).href}, '*'); }
+      catch(e) { _oa && _oa.call(this, v); }
+    };
+    var _or = _lp.replace;
+    _lp.replace = function(v) {
+      try { window.parent.postMessage({type:'rpNav', url: new URL(String(v), BASE).href}, '*'); }
+      catch(e) { _or && _or.call(this, v); }
+    };
+  } catch(e) {}
+
+  /* ── HTMLFormElement.prototype.submit ────────────────────────────────────────
+     Programmatic form.submit() does NOT fire the 'submit' event, so our
+     listener below misses it. Startpage and many sites call form.submit()
+     directly when clicking tab buttons (Images, Video, Shopping…).
+     Overriding the prototype method catches these calls. */
+  try {
+    var _fs = HTMLFormElement.prototype.submit;
+    HTMLFormElement.prototype.submit = function() {
+      var f      = this;
+      var action = f.getAttribute('data-pform') || f.getAttribute('action') || BASE;
+      var method = (f.getAttribute('method') || 'get').toLowerCase();
+      try { action = new URL(action, BASE).href; } catch(e) {}
+      if (method === 'get') {
+        var qs = new URLSearchParams(new FormData(f)).toString();
+        window.parent.postMessage({type:'rpNav', url: action + (qs ? '?' + qs : '')}, '*');
+      } else {
+        var body = new FormData(f);
+        fetch(px(action), {method:'POST', body: body})
+          .then(function(r){ return r.text(); })
+          .then(function(html){
+            window.parent.postMessage({type:'rpHtml', url: action, html: html}, '*');
+          }).catch(function(){});
+      }
+    };
+  } catch(e) {}
 
   /* ── fetch ── */
   var _fetch = window.fetch;
   window.fetch = function(resource, opts) {
     if (typeof resource === 'string') resource = px(resource);
-    else if (resource instanceof Request) {
+    else if (resource && typeof resource === 'object' && resource.url) {
       try { resource = new Request(px(resource.url), resource); } catch(e){}
     }
     return _fetch.call(window, resource, opts);
   };
 
   /* ── XMLHttpRequest ── */
-  var _open = XMLHttpRequest.prototype.open;
+  var _xhrOpen = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function(method, url) {
     var rest = Array.prototype.slice.call(arguments, 2);
-    return _open.apply(this, [method, px(url)].concat(rest));
+    return _xhrOpen.apply(this, [method, px(url)].concat(rest));
   };
 
   /* ── window.open ── */
-  var _wopen = window.open;
-  window.open = function(url, target, features) {
-    window.parent.postMessage({type:'rpNav', url: new URL(url||'', BASE).href}, '*');
+  window.open = function(url) {
+    try { window.parent.postMessage({type:'rpNav', url: new URL(url||'', BASE).href}, '*'); }
+    catch(e) {}
     return null;
   };
 
-  /* ── Link click → postMessage to parent ── */
+  /* ── history.pushState / replaceState ── */
+  ['pushState','replaceState'].forEach(function(method) {
+    var orig = history[method];
+    history[method] = function(state, title, url) {
+      orig.apply(history, arguments);
+      if (url) {
+        try {
+          /* Update the spoofed BASE so subsequent location reads are correct */
+          _baseU = new URL(url, BASE);
+          BASE   = _baseU.href;
+          window.parent.postMessage({type:'rpUrlChange', url: BASE}, '*');
+        } catch(e) {}
+      }
+    };
+  });
+
+  /* ── Link clicks ── */
   document.addEventListener('click', function(e) {
     var el = e.target.closest('a[data-pnav]');
     if (!el) return;
@@ -993,9 +1100,9 @@ function rewriteForProxy(html, baseUrl) {
     window.parent.postMessage({type:'rpNav', url: href}, '*');
   }, true);
 
-  /* ── Form submit → postMessage to parent ── */
+  /* ── Form submit event (user-triggered submits) ── */
   document.addEventListener('submit', function(e) {
-    var f = e.target;
+    var f      = e.target;
     var action = f.getAttribute('data-pform') || BASE;
     e.preventDefault();
     var method = (f.method || 'get').toLowerCase();
@@ -1003,31 +1110,13 @@ function rewriteForProxy(html, baseUrl) {
       var qs = new URLSearchParams(new FormData(f)).toString();
       window.parent.postMessage({type:'rpNav', url: action + (qs ? '?' + qs : '')}, '*');
     } else {
-      /* POST — fetch it and navigate to result */
-      var body = new FormData(f);
-      fetch(px(action), {method:'POST', body: body})
+      fetch(px(action), {method:'POST', body: new FormData(f)})
         .then(function(r){ return r.text(); })
         .then(function(html){
           window.parent.postMessage({type:'rpHtml', url: action, html: html}, '*');
-        });
+        }).catch(function(){});
     }
   }, true);
-
-  /* ── history.pushState / replaceState navigation ── */
-  function wrapHistory(method) {
-    var orig = history[method];
-    history[method] = function(state, title, url) {
-      orig.apply(history, arguments);
-      if (url) {
-        try {
-          var abs = new URL(url, BASE).href;
-          window.parent.postMessage({type:'rpUrlChange', url: abs}, '*');
-        } catch(e){}
-      }
-    };
-  }
-  wrapHistory('pushState');
-  wrapHistory('replaceState');
 
 })();`;
 
