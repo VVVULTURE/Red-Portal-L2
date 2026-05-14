@@ -310,6 +310,16 @@ server.on('upgrade', (req, socket, head) => {
     });
 });
 
+// ── Global wildcard CORS ──────────────────────────────────────────────────────
+// Applied to every response — static files, proxy responses, and error pages —
+// so the server can be fetched from any origin.
+
+app.use((req, res, next) => {
+    applyCors(res);
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    next();
+});
+
 // ── HTTP proxy middleware ─────────────────────────────────────────────────────
 
 app.use(async (req, res, next) => {
@@ -318,11 +328,6 @@ app.use(async (req, res, next) => {
     const rawUrl = `http://localhost${req.url}`;
     const target = new URL(rawUrl).searchParams.get('url');
     if (!target) return next();
-
-    if (req.method === 'OPTIONS') {
-        applyCors(res);
-        return res.sendStatus(204);
-    }
 
     // Derive the workerBase from the incoming request so the shim bakes
     // in the correct URL even when running behind Koyeb's reverse proxy.
@@ -363,7 +368,6 @@ app.use(async (req, res, next) => {
             redirect: 'follow',
         });
     } catch (err) {
-        applyCors(res);
         return res.status(502).type('text/plain').send('Proxy fetch failed: ' + err.message);
     }
 
@@ -371,7 +375,6 @@ app.use(async (req, res, next) => {
     const finalTarget = upstream.url || target;
     const ct          = upstream.headers.get('content-type') || 'text/html';
 
-    applyCors(res);
     res.status(upstream.status);
     res.setHeader('content-type', ct);
 
