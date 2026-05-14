@@ -100,13 +100,14 @@ function buildShim(target, workerBase) {
 
     const code = `(function(){
         var W=${W},BASE=${BASE},_bu=new URL(BASE),_nl=null;
+        var _realParent=window.parent; /* saved before we spoof window.parent */
 
         function navTo(u){
             try{
                 var a=new URL(String(u),BASE).href;
                 var p=W+'?url='+encodeURIComponent(a);
                 if(_nl){ _nl.call(window.location,p); return; }
-                window.parent.postMessage({type:'rpNav',url:a},'*');
+                _realParent.postMessage({type:'rpNav',url:a},'*');
             }catch(e){}
         }
 
@@ -146,22 +147,76 @@ function buildShim(target, workerBase) {
             _lp.replace =function(v){navTo(v);};
         }catch(e){}
 
-        /* ── Spoof document.URL / documentURI / referrer / domain ──────────────────
-         *  Ad scripts (e.g. Google AFS) read these directly instead of going through
-         *  window.location, so they would otherwise expose the proxy URL. */
+        /* ── Spoof document.* identity properties ───────────────────────────────────
+         *  Scripts read these directly instead of window.location, so they bypass
+         *  the location spoof above and expose the proxy URL. */
         try{
             Object.defineProperty(document,'URL',          {get:function(){return BASE;},configurable:true});
             Object.defineProperty(document,'documentURI',  {get:function(){return BASE;},configurable:true});
-            /* Blank the referrer so the proxy origin isn't sent to ad networks */
+            Object.defineProperty(document,'baseURI',      {get:function(){return BASE;},configurable:true});
+            /* Blank the referrer — prevents proxy origin leaking to ad networks */
             Object.defineProperty(document,'referrer',     {get:function(){return '';},configurable:true});
             /* Spoof domain to match the target site */
             Object.defineProperty(document,'domain',       {get:function(){return _bu.hostname;},configurable:true});
         }catch(e){}
 
+        /* ── Performance API ─────────────────────────────────────────────────────────
+         *  performance.getEntriesByType('navigation')[0].name returns the real
+         *  iframe URL. Wrap the call so navigation entry names are replaced. */
+        try{
+            var _pGet =performance.getEntries.bind(performance);
+            var _pGEBT=performance.getEntriesByType.bind(performance);
+            var _pGEBN=performance.getEntriesByName.bind(performance);
+            function _patchEntries(entries){
+                return entries.map(function(e){
+                    if(e.entryType==='navigation'||e.entryType==='resource'){
+                        try{
+                            return new Proxy(e,{get:function(t,k){
+                                if(k==='name'||k==='initiatorType'&&false) return BASE;
+                                if(k==='name') return BASE;
+                                var v=t[k];
+                                return typeof v==='function'?v.bind(t):v;
+                            }});
+                        }catch(_){}
+                    }
+                    return e;
+                });
+            }
+            performance.getEntries     =function(){return _patchEntries(_pGet());};
+            performance.getEntriesByType=function(t){return _patchEntries(_pGEBT(t));};
+            performance.getEntriesByName=function(n,t){return _patchEntries(_pGEBN(n,t));};
+        }catch(e){}
+
+        /* ── Dynamic element src / href setters ──────────────────────────────────────
+         *  JS-created elements (new Image(), createElement('script'), etc.) set src
+         *  or href via prototype setters which bypass HTMLRewriter. Intercept each
+         *  so those resources also load through the proxy. */
+        (function(){
+            var pairs=[
+                [HTMLImageElement.prototype,   'src'],
+                [HTMLScriptElement.prototype,  'src'],
+                [HTMLIFrameElement.prototype,  'src'],
+                [HTMLSourceElement.prototype,  'src'],
+                [HTMLVideoElement.prototype,   'src'],
+                [HTMLAudioElement.prototype,   'src'],
+                [HTMLLinkElement.prototype,    'href'],
+            ];
+            pairs.forEach(function(pair){
+                try{
+                    var proto=pair[0],attr=pair[1];
+                    var desc=Object.getOwnPropertyDescriptor(proto,attr);
+                    if(!desc||!desc.set) return;
+                    Object.defineProperty(proto,attr,{
+                        set:function(v){ desc.set.call(this,px(v)); },
+                        get:desc.get,
+                        configurable:true,
+                    });
+                }catch(e){}
+            });
+        })();
+
         /* ── navigator.sendBeacon ────────────────────────────────────────────────────
-         *  Beacon calls bypass the fetch/XHR intercepts. Route them through px() so
-         *  they go through the proxy, preventing the real URL from appearing in the
-         *  beacon payload or the HTTP Referer on the tracking server's side. */
+         *  Beacon calls bypass the fetch/XHR intercepts entirely. */
         if(navigator.sendBeacon){
             var _sb=navigator.sendBeacon.bind(navigator);
             navigator.sendBeacon=function(url,data){
@@ -169,6 +224,52 @@ function buildShim(target, workerBase) {
                 return _sb(url,data);
             };
         }
+
+        /* ── Hide iframe context ────────────────────────────────────────────────────
+         *  Proxy + parent share the same origin, so window.parent, window.top, and
+         *  window.frameElement are all readable by page JS — each one exposes the
+         *  proxy URL.  Spoof them so the page thinks it's a standalone top-level tab.
+         *  _realParent (saved above) is still used for our own postMessage calls. */
+        try{
+            Object.defineProperty(window,'parent',      {get:function(){return window;},configurable:true});
+            Object.defineProperty(window,'top',         {get:function(){return window;},configurable:true});
+            Object.defineProperty(window,'frameElement',{get:function(){return null;}, configurable:true});
+        }catch(e){}
+
+        /* ── document.baseURI ───────────────────────────────────────────────────────
+         *  baseURI returns the actual iframe URL (the proxy URL), not the spoofed one.
+         *  Override it to match BASE. */
+        try{
+            Object.defineProperty(document,'baseURI',{get:function(){return BASE;},configurable:true});
+        }catch(e){}
+
+        /* ── Performance navigation entries ─────────────────────────────────────────
+         *  performance.getEntriesByType('navigation')[0].name is the actual page URL.
+         *  Wrap the method to return spoofed entries. */
+        try{
+            var _gEBT=performance.getEntriesByType.bind(performance);
+            performance.getEntriesByType=function(type){
+                var entries=_gEBT(type);
+                if(type==='navigation'){
+                    return entries.map(function(e){
+                        return new Proxy(e,{get:function(t,p){
+                            if(p==='name'||p==='initiatorType') return p==='name'?BASE:'navigation';
+                            return typeof t[p]==='function'?t[p].bind(t):t[p];
+                        }});
+                    });
+                }
+                return entries;
+            };
+            var _gE=performance.getEntries.bind(performance);
+            performance.getEntries=function(){
+                return _gE().map(function(e){
+                    if(e.entryType!=='navigation') return e;
+                    return new Proxy(e,{get:function(t,p){
+                        return p==='name'?BASE:(typeof t[p]==='function'?t[p].bind(t):t[p]);
+                    }});
+                });
+            };
+        }catch(e){}
 
         var _fe=window.fetch;
         window.fetch=function(r,o){
@@ -229,15 +330,15 @@ function buildShim(target, workerBase) {
                 if(u){
                     try{
                         _bu=new URL(u,BASE); BASE=_bu.href;
-                        window.parent.postMessage({type:'rpUrlChange',url:BASE},'*');
+                        _realParent.postMessage({type:'rpUrlChange',url:BASE},'*');
                     }catch(e){}
                 }
             };
         });
 
-        window.parent.postMessage({type:'rpUrl',url:BASE},'*');
+        _realParent.postMessage({type:'rpUrl',url:BASE},'*');
         window.addEventListener('load',function(){
-            window.parent.postMessage({type:'rpUrl',url:BASE},'*');
+            _realParent.postMessage({type:'rpUrl',url:BASE},'*');
         });
 
     })()`;
