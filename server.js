@@ -3,20 +3,32 @@
 /**
  * Red Portal — Node.js / Express Proxy Server
  *
- * Direct port of the Cloudflare Worker.  Drop this in a Koyeb (or any
- * Node ≥ 18) service alongside the public/ folder.
+ * Drop-in replacement for the Cloudflare Worker, deployable on Koyeb.
  *
- * Proxy endpoint  : GET|POST  /?url=https://example.com   (same path as the CF worker)
- * WebSocket proxy : WS        /?url=wss://example.com
- * Static files    : everything else → served from ./public/
+ * Proxy endpoint  : GET|POST  /[SECRET]?url=https://example.com
+ * WebSocket proxy : WS        /[SECRET]?url=wss://example.com
+ * Static files    : GET /  → public/index.html (DEFAULT_WORKER injected at serve time)
+ *                   GET /* → public/* (other assets)
  *
  * Env vars
- *   PORT   – port to listen on (Koyeb sets this automatically)
+ *   PORT          – port to listen on (Koyeb sets this automatically)
+ *   PROXY_SECRET  – optional secret path segment; when set, any proxy request
+ *                   that doesn't include it as the first path segment gets 403.
+ *                   Leave unset (or empty) for open access during development.
+ *
+ * How the secret works
+ *   PROXY_SECRET=abc123 means:
+ *     - allowed:  GET  /abc123?url=https://example.com
+ *     - forbidden: GET /?url=https://example.com   → 403
+ *     - forbidden: GET /wrong?url=https://example.com → 403
+ *   The HTML is served with DEFAULT_WORKER already set to https://host/abc123,
+ *   so the shim bakes that path into every URL it generates — no extra logic needed.
  */
 
 const express      = require('express');
 const http         = require('http');
 const path         = require('path');
+const fs           = require('fs');
 const { Readable } = require('stream');
 const { WebSocket, WebSocketServer } = require('ws');
 const cheerio      = require('cheerio');
@@ -25,7 +37,15 @@ const app    = express();
 const server = http.createServer(app);
 const PORT   = process.env.PORT || 8000;
 
-// ── CORS headers ──────────────────────────────────────────────────────────────
+// Secret path segment.  Set PROXY_SECRET=somethingRandom on Koyeb.
+const PROXY_SECRET = (process.env.PROXY_SECRET || '').trim();
+
+// Cache the HTML template — only read from disk once
+const HTML_TEMPLATE = fs.readFileSync(
+    path.join(__dirname, 'public', 'index.html'), 'utf8'
+);
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function applyCors(res) {
     res.setHeader('access-control-allow-origin',  '*');
@@ -36,12 +56,17 @@ function applyCors(res) {
     res.setHeader('cache-control',                'public, max-age=60');
 }
 
+/** Derive the full worker base URL from an incoming request, including the secret path. */
+function getWorkerBase(req) {
+    const proto = req.headers['x-forwarded-proto'] || (req.socket.encrypted ? 'https' : 'http');
+    const host  = req.headers['x-forwarded-host']  || req.headers.host;
+    return PROXY_SECRET
+        ? `${proto}://${host}/${PROXY_SECRET}`
+        : `${proto}://${host}`;
+}
+
 // ── URL rewriter helpers ──────────────────────────────────────────────────────
 
-/**
- * Returns a rewriter function scoped to a specific target + workerBase pair.
- * Mirrors the rw() closure in buildRewriter() from the CF worker.
- */
 function makeRw(target, workerBase) {
     return function rw(v) {
         if (!v) return v;
@@ -68,7 +93,6 @@ function rwSrcset(v, rw) {
 }
 
 // ── Shim builder ──────────────────────────────────────────────────────────────
-// Identical logic to buildShim() in the CF worker — the injected JS is the same.
 
 function buildShim(target, workerBase) {
     const W    = JSON.stringify(workerBase);
@@ -77,21 +101,15 @@ function buildShim(target, workerBase) {
     const code = `(function(){
         var W=${W},BASE=${BASE},_bu=new URL(BASE),_nl=null;
 
-        /* Navigate the iframe (real HTTP request) to a proxied URL */
         function navTo(u){
             try{
                 var a=new URL(String(u),BASE).href;
                 var p=W+'?url='+encodeURIComponent(a);
                 if(_nl){ _nl.call(window.location,p); return; }
-                /* _nl wasn't captured (sandboxed iframe) — ask parent to drive the
-                   navigation instead.  The old fallback that re-read the descriptor
-                   here caused infinite recursion because the shim had already
-                   overwritten location.href's setter. */
                 window.parent.postMessage({type:'rpNav',url:a},'*');
             }catch(e){}
         }
 
-        /* Route any URL through the worker */
         function px(u){
             if(!u||typeof u!=='string')return u;
             u=u.trim();
@@ -102,12 +120,10 @@ function buildShim(target, workerBase) {
             }catch(e){return u;}
         }
 
-        /* ── Spoof window.location ──────────────────────────────────────────────── */
         try{
             var _lp=Object.getPrototypeOf(window.location);
             var _hd=Object.getOwnPropertyDescriptor(_lp,'href');
             _nl=_hd&&_hd.set;
-
             var PROPS=[
                 ['href',     function(){return BASE;}],
                 ['origin',   function(){return _bu.origin;}],
@@ -126,12 +142,10 @@ function buildShim(target, workerBase) {
                     Object.defineProperty(_lp,pair[0],desc);
                 }catch(e){}
             });
-
             _lp.assign =function(v){navTo(v);};
             _lp.replace =function(v){navTo(v);};
         }catch(e){}
 
-        /* ── fetch ── */
         var _fe=window.fetch;
         window.fetch=function(r,o){
             if(typeof r==='string') r=px(r);
@@ -139,13 +153,11 @@ function buildShim(target, workerBase) {
             return _fe.call(window,r,o);
         };
 
-        /* ── XMLHttpRequest ── */
         var _xo=XMLHttpRequest.prototype.open;
         XMLHttpRequest.prototype.open=function(m,u){
             return _xo.apply(this,[m,px(u)].concat(Array.prototype.slice.call(arguments,2)));
         };
 
-        /* ── WebSocket ──────────────────────────────────────────────────────────── */
         var _WS=window.WebSocket;
         window.WebSocket=function(url,protocols){
             var ws=url;
@@ -163,21 +175,17 @@ function buildShim(target, workerBase) {
         window.WebSocket.CLOSING=_WS.CLOSING;
         window.WebSocket.CLOSED=_WS.CLOSED;
 
-        /* ── window.open ── */
         window.open=function(u){ navTo(u||''); return null; };
 
-        /* ── Block runtime target=_blank ────────────────────────────────────────── */
         var _sa=Element.prototype.setAttribute;
         Element.prototype.setAttribute=function(name,val){
             if(name==='target'&&/^(_blank|_top|_parent)$/i.test(String(val))) return;
             return _sa.call(this,name,val);
         };
 
-        /* ── Form handling ──────────────────────────────────────────────────────── */
         function doForm(f){
             var action=f.getAttribute('action')||BASE;
             try{ action=new URL(action,BASE).href; }catch(e){}
-            /* Unwrap a worker URL if the HTMLRewriter already proxied the action */
             try{
                 var au=new URL(action);
                 if(au.origin+au.pathname===new URL(W).origin+new URL(W).pathname && au.searchParams.get('url')){
@@ -190,7 +198,6 @@ function buildShim(target, workerBase) {
         HTMLFormElement.prototype.submit=function(){ doForm(this); };
         document.addEventListener('submit',function(e){ e.preventDefault(); doForm(e.target); },true);
 
-        /* ── history.pushState / replaceState ───────────────────────────────────── */
         ['pushState','replaceState'].forEach(function(m){
             var orig=history[m];
             history[m]=function(s,t,u){
@@ -214,18 +221,14 @@ function buildShim(target, workerBase) {
     return `<script data-rp>${code}<\/script>`;
 }
 
-// ── HTML rewriter (cheerio replaces Cloudflare's HTMLRewriter) ────────────────
+// ── HTML rewriter ─────────────────────────────────────────────────────────────
 
 function rewriteHtml(html, target, workerBase) {
     const rw = makeRw(target, workerBase);
+    const $  = cheerio.load(html, { decodeEntities: false });
 
-    // decodeEntities:false preserves the original encoding of special chars
-    const $ = cheerio.load(html, { decodeEntities: false });
-
-    // Inject shim as the first child of <head> so it runs before any page JS
     $('head').prepend(buildShim(target, workerBase));
 
-    // Asset URLs
     const rwAttr = (sel, attr) =>
         $(sel).each((_, el) => $(el).attr(attr, rw($(el).attr(attr))));
 
@@ -242,22 +245,15 @@ function rewriteHtml(html, target, workerBase) {
         $(el).attr('srcset', rwSrcset($(el).attr('srcset'), rw));
     });
 
-    // Navigation links — rewrite href, strip target
     $('a[href]').each((_, el) => {
         $(el).attr('href', rw($(el).attr('href')));
         $(el).removeAttr('target');
     });
 
-    // Forms — only strip target (doForm in the shim handles action proxying)
     $('form').removeAttr('target');
-
-    // <base target="_blank"> would silently make every link open a new tab
     $('base').removeAttr('target');
-
-    // Strip CSP (it would block our proxied resources)
     $('meta[http-equiv="Content-Security-Policy"]').remove();
 
-    // Rewrite meta-refresh redirects
     $('meta[http-equiv="refresh"]').each((_, el) => {
         const c = $(el).attr('content') || '';
         const m = c.match(/^(\d+;\s*url=)(.+)$/i);
@@ -267,52 +263,7 @@ function rewriteHtml(html, target, workerBase) {
     return $.html();
 }
 
-// ── WebSocket proxy ───────────────────────────────────────────────────────────
-
-const wss = new WebSocketServer({ noServer: true });
-
-server.on('upgrade', (req, socket, head) => {
-    const rawUrl = `http://localhost${req.url}`;
-    const target = new URL(rawUrl).searchParams.get('url');
-
-    if (!target) {
-        socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
-        socket.destroy();
-        return;
-    }
-
-    wss.handleUpgrade(req, socket, head, clientWs => {
-        // Convert http(s) → ws(s) in case the shim sent an http URL
-        const wsTarget = target.replace(/^http/, 'ws');
-
-        let upstream;
-        try {
-            upstream = new WebSocket(wsTarget);
-        } catch (err) {
-            clientWs.close(1011, 'upstream connect failed');
-            return;
-        }
-
-        upstream.on('open', () => {
-            // client → upstream
-            clientWs.on('message', data => { try { upstream.send(data); } catch {} });
-            clientWs.on('close',  (code, reason) => { try { upstream.close(code, reason); } catch {} });
-
-            // upstream → client
-            upstream.on('message', data => { try { clientWs.send(data); } catch {} });
-            upstream.on('close',  (code, reason) => { try { clientWs.close(code, reason); } catch {} });
-            upstream.on('error',  ()             => { try { clientWs.close(1011, 'upstream error'); } catch {} });
-        });
-
-        upstream.on('error', () => {
-            try { clientWs.close(1011, 'upstream connect error'); } catch {}
-        });
-    });
-});
-
 // ── Global wildcard CORS ──────────────────────────────────────────────────────
-// Applied to every response — static files, proxy responses, and error pages —
-// so the server can be fetched from any origin.
 
 app.use((req, res, next) => {
     applyCors(res);
@@ -320,22 +271,42 @@ app.use((req, res, next) => {
     next();
 });
 
-// ── HTTP proxy middleware ─────────────────────────────────────────────────────
+// ── Frontend — serve index.html with DEFAULT_WORKER injected ──────────────────
+// Must come BEFORE the proxy middleware so GET / is never treated as a proxy request.
+
+app.get('/', (req, res) => {
+    const workerBase = getWorkerBase(req);
+    // Overwrite DEFAULT_WORKER (whatever URL is hardcoded in the file) with the
+    // correct value for this deployment, including the secret path if set.
+    const html = HTML_TEMPLATE.replace(
+        /const DEFAULT_WORKER\s*=\s*['"][^'"]*['"]/,
+        `const DEFAULT_WORKER = ${JSON.stringify(workerBase)}`
+    );
+    res.setHeader('content-type', 'text/html; charset=utf-8');
+    res.send(html);
+});
+
+// ── Secret gate + HTTP proxy ──────────────────────────────────────────────────
+// Registered as a single middleware so the gate is always checked before the
+// upstream fetch is attempted.
 
 app.use(async (req, res, next) => {
-    // Only intercept requests that carry a ?url= param; everything else
-    // falls through to the static file middleware below.
     const rawUrl = `http://localhost${req.url}`;
     const target = new URL(rawUrl).searchParams.get('url');
-    if (!target) return next();
+    if (!target) return next();   // not a proxy request → static files below
 
-    // Derive the workerBase from the incoming request so the shim bakes
-    // in the correct URL even when running behind Koyeb's reverse proxy.
-    const proto      = req.headers['x-forwarded-proto'] || (req.socket.encrypted ? 'https' : 'http');
-    const host       = req.headers['x-forwarded-host'] || req.headers.host;
-    const workerBase = `${proto}://${host}`;   // e.g. https://my-app.koyeb.app
+    // ── Secret check ──────────────────────────────────────────────────────────
+    if (PROXY_SECRET) {
+        // req.path for /abc123?url=... is '/abc123'
+        const pathSecret = req.path.replace(/^\//, '').split('/')[0];
+        if (pathSecret !== PROXY_SECRET) {
+            return res.status(403).type('text/plain').send('Forbidden');
+        }
+    }
 
-    // Buffer the request body so we can forward it (streams are single-read)
+    // ── Proxy ─────────────────────────────────────────────────────────────────
+    const workerBase = getWorkerBase(req);
+
     let body;
     if (!['GET', 'HEAD'].includes(req.method)) {
         body = await new Promise((resolve, reject) => {
@@ -360,7 +331,7 @@ app.use(async (req, res, next) => {
                     'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                 'Accept-Language':  'en-US,en;q=0.9',
                 'Accept-Encoding':  'gzip, deflate, br',
-                'Referer':          target,   // full URL, not just origin (fixes Startpage AJAX tabs)
+                'Referer':          target,
                 'DNT':              '1',
                 'Upgrade-Insecure-Requests': '1',
             },
@@ -371,7 +342,6 @@ app.use(async (req, res, next) => {
         return res.status(502).type('text/plain').send('Proxy fetch failed: ' + err.message);
     }
 
-    // Use the final URL after redirects as BASE so SPA navigation resolves correctly
     const finalTarget = upstream.url || target;
     const ct          = upstream.headers.get('content-type') || 'text/html';
 
@@ -384,17 +354,68 @@ app.use(async (req, res, next) => {
         return res.send(rewritten);
     }
 
-    // Non-HTML (images, JS, CSS, fonts …) — stream straight through
     Readable.fromWeb(upstream.body).pipe(res);
 });
 
-// ── Static files (the frontend HTML + assets) ─────────────────────────────────
-// Anything without a ?url= param lands here.
+// ── Static files ──────────────────────────────────────────────────────────────
 
 app.use(express.static(path.join(__dirname, 'public')));
+
+// ── WebSocket proxy ───────────────────────────────────────────────────────────
+
+const wss = new WebSocketServer({ noServer: true });
+
+server.on('upgrade', (req, socket, head) => {
+    const rawUrl = `http://localhost${req.url}`;
+    const target = new URL(rawUrl).searchParams.get('url');
+
+    if (!target) {
+        socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+        socket.destroy();
+        return;
+    }
+
+    // Secret check for WebSocket upgrades
+    if (PROXY_SECRET) {
+        const pathSecret = req.url.split('?')[0].replace(/^\//, '').split('/')[0];
+        if (pathSecret !== PROXY_SECRET) {
+            socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+            socket.destroy();
+            return;
+        }
+    }
+
+    wss.handleUpgrade(req, socket, head, clientWs => {
+        const wsTarget = target.replace(/^http/, 'ws');
+        let upstream;
+        try {
+            upstream = new WebSocket(wsTarget);
+        } catch (err) {
+            clientWs.close(1011, 'upstream connect failed');
+            return;
+        }
+
+        upstream.on('open', () => {
+            clientWs.on('message', data => { try { upstream.send(data); } catch {} });
+            clientWs.on('close',  (code, reason) => { try { upstream.close(code, reason); } catch {} });
+            upstream.on('message', data => { try { clientWs.send(data); } catch {} });
+            upstream.on('close',  (code, reason) => { try { clientWs.close(code, reason); } catch {} });
+            upstream.on('error',  ()             => { try { clientWs.close(1011, 'upstream error'); } catch {} });
+        });
+
+        upstream.on('error', () => {
+            try { clientWs.close(1011, 'upstream connect error'); } catch {}
+        });
+    });
+});
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 server.listen(PORT, () => {
     console.log(`Red Portal proxy listening on port ${PORT}`);
+    if (PROXY_SECRET) {
+        console.log(`Secret path active — proxy endpoint: /${PROXY_SECRET}?url=...`);
+    } else {
+        console.log('No PROXY_SECRET set — proxy is open (fine for local dev)');
+    }
 });
