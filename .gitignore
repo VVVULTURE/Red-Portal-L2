@@ -1,0 +1,13 @@
+# Node dependencies
+node_modules/
+.node_modules/
+
+# npm cache and logs
+.npm/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-store/
+
+# Optional: Ignore VS Code / Codespace workspace settings if you don't want to share them
+.vscode/

@@ -253,14 +253,26 @@
     .status.err { color: #f87171; }
 
     /* ── PROXY BROWSER ── */
+
+    /*
+     * Grid layout: toolbar row is auto height, viewport row takes the rest.
+     * This is the most reliable way to give an iframe a known height.
+     */
     .browser-shell {
-      background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
-      overflow: hidden; box-shadow: var(--card-shadow); display: flex; flex-direction: column;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      box-shadow: var(--card-shadow);
+      display: grid;
+      grid-template-rows: auto 1fr;
+      height: 82vh;
     }
+
     .browser-toolbar {
       display: flex; align-items: center; gap: .4rem; padding: .55rem .75rem;
-      background: var(--bg); border-bottom: 1px solid var(--border); flex-shrink: 0;
+      background: var(--bg); border-bottom: 1px solid var(--border);
     }
+
     .browser-url-wrap { flex: 1; position: relative; }
     .browser-url-wrap svg {
       position: absolute; left: .7rem; top: 50%; transform: translateY(-50%);
@@ -276,8 +288,18 @@
     #browserUrl:focus { border-color: var(--red); box-shadow: var(--glow-sm); }
     #browserUrl::placeholder { color: var(--muted); }
 
-    .browser-viewport { position: relative; flex: 1; min-height: 70vh; background: #fff; }
-    #browserFrame { width: 100%; height: 100%; min-height: 70vh; border: none; display: block; }
+    /* The grid cell gives this div an explicit height, so height:100% works on children */
+    .browser-viewport {
+      position: relative;
+      overflow: hidden;
+    }
+    /* Frame fills its parent div exactly */
+    #browserFrame {
+      width: 100%;
+      height: 100%;
+      border: none;
+      display: block;
+    }
 
     .browser-loading {
       position: absolute; inset: 0; background: var(--bg);
@@ -289,7 +311,7 @@
       width: 36px; height: 36px; border: 3px solid var(--border);
       border-top-color: var(--red); border-radius: 50%; animation: spin .7s linear infinite;
     }
-    @keyframes spin { to{transform:rotate(360deg)} }
+    @keyframes spin { to { transform: rotate(360deg); } }
     .browser-loading p { font-family: 'Share Tech Mono', monospace; font-size: .82rem; color: var(--muted); }
 
     .browser-welcome {
@@ -301,11 +323,15 @@
     .browser-welcome p { font-size: 1rem; font-weight: 600; letter-spacing: .06em; }
     .browser-welcome small { font-size: .8rem; opacity: .7; }
 
+    /* Fullscreen — same grid layout, just pinned to the full viewport */
     .browser-shell.fs {
-      position: fixed; inset: 0; z-index: 9999; border-radius: 0; border: none;
+      position: fixed;
+      inset: 0;
+      z-index: 9999;
+      border-radius: 0;
+      border: none;
+      height: 100vh;
     }
-    .browser-shell.fs .browser-viewport,
-    .browser-shell.fs #browserFrame { min-height: unset; height: 100%; }
 
     /* ── WORKER CONFIG (credits) ── */
     .worker-config-card { margin-top: 2rem; border-top: 1px solid var(--border); padding-top: 1.5rem; }
@@ -393,25 +419,54 @@
     </ol>
     <pre>export default {
   async fetch(request) {
-    const url = new URL(request.url);
+    const url    = new URL(request.url);
     const target = url.searchParams.get("url");
+
     if (!target) return new Response("Missing ?url=", { status: 400 });
-    const res = await fetch(target, {
-      headers: { "User-Agent": request.headers.get("User-Agent") || "Mozilla/5.0" },
-      redirect: "follow",
-    });
-    const body = await res.arrayBuffer();
-    const ct = res.headers.get("content-type") || "text/html";
-    return new Response(body, {
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: cors() });
+    }
+
+    let res;
+    try {
+      res = await fetch(target, {
+        method: request.method,
+        headers: {
+          "User-Agent":      request.headers.get("User-Agent") ||
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+          "Accept":          request.headers.get("Accept") ||
+            "text/html,application/xhtml+xml,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9",
+          "Referer":         new URL(target).origin + "/",
+        },
+        body: ["GET","HEAD"].includes(request.method) ? undefined : request.body,
+        redirect: "follow",
+      });
+    } catch (e) {
+      return new Response("Fetch failed: " + e.message,
+        { status: 502, headers: { ...cors(), "content-type": "text/plain" } });
+    }
+
+    return new Response(res.body, {
       status: res.status,
       headers: {
-        "content-type": ct,
-        "access-control-allow-origin": "*",
-        "x-frame-options": "ALLOWALL",
+        ...cors(),
+        "content-type": res.headers.get("content-type") || "text/html",
       },
     });
   },
-};</pre>
+};
+
+function cors() {
+  return {
+    "access-control-allow-origin":  "*",
+    "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
+    "access-control-allow-headers": "*",
+    "x-frame-options":              "ALLOWALL",
+    "content-security-policy":      "",
+  };
+}</pre>
     <div class="field">
       <label class="section-label" for="modalWorkerInput">Your Worker URL</label>
       <div class="worker-url-row">
@@ -652,7 +707,7 @@
 /* ═══════════════════════════════
    STATE
 ═══════════════════════════════ */
-const DEFAULT_WORKER = 'https://super-heart-b1da.red-gale7.workers.dev';
+const DEFAULT_WORKER = 'https://YOUR-APP-NAME.koyeb.app';  // ← replace with your Koyeb URL
 const state = {
   proxyOn:   true,
   workerUrl: localStorage.getItem('rp_worker_url') || DEFAULT_WORKER,
@@ -836,120 +891,371 @@ function bUpdateNav() {
   $btnFwd.disabled  = bState.index >= bState.history.length - 1;
 }
 
-/* Rewrite HTML: proxy assets, intercept link clicks via postMessage */
+/* Rewrite HTML: proxy assets + inject shim that intercepts fetch/XHR/navigation */
 function rewriteForProxy(html, baseUrl) {
   const w = state.workerUrl.replace(/\/$/,'');
   const doc = new DOMParser().parseFromString(html, 'text/html');
 
-  function abs(v) { try { return new URL(v, baseUrl).href; } catch { return null; } }
+  function abs(v) {
+    if (!v) return null;
+    if (/^(data:|blob:|javascript:|#|mailto:|tel:)/.test(v.trim())) return null;
+    try { return new URL(v.trim(), baseUrl).href; } catch { return null; }
+  }
 
-  // proxy asset URLs
+  // Proxy all static asset URLs so images/styles/scripts load through the worker
   doc.querySelectorAll('img[src],video[src],audio[src],source[src],track[src]').forEach(el => {
     const a = abs(el.getAttribute('src'));
-    if (a && !/^(data|blob):/.test(a)) el.src = `${w}?url=${encodeURIComponent(a)}`;
+    if (a) el.setAttribute('src', `${w}?url=${encodeURIComponent(a)}`);
   });
   doc.querySelectorAll('script[src]').forEach(el => {
     const a = abs(el.getAttribute('src'));
-    if (a && !/^(data|blob):/.test(a)) el.setAttribute('src', `${w}?url=${encodeURIComponent(a)}`);
+    if (a) el.setAttribute('src', `${w}?url=${encodeURIComponent(a)}`);
   });
   doc.querySelectorAll('link[href]').forEach(el => {
     const a = abs(el.getAttribute('href'));
-    if (a && !/^(data|blob|#):/.test(a)) el.setAttribute('href', `${w}?url=${encodeURIComponent(a)}`);
+    if (a) el.setAttribute('href', `${w}?url=${encodeURIComponent(a)}`);
+  });
+  // srcset (responsive images)
+  doc.querySelectorAll('[srcset]').forEach(el => {
+    const rewritten = el.getAttribute('srcset').split(',').map(part => {
+      const [u, ...desc] = part.trim().split(/\s+/);
+      const a = abs(u);
+      return a ? [`${w}?url=${encodeURIComponent(a)}`, ...desc].join(' ') : part;
+    }).join(', ');
+    el.setAttribute('srcset', rewritten);
   });
 
-  // intercept anchor clicks
+  // Mark anchor hrefs for the shim to intercept (keep href so right-click/preview works)
   doc.querySelectorAll('a[href]').forEach(el => {
-    const href = el.getAttribute('href');
-    if (!href || href.startsWith('#') || href.startsWith('javascript:')) return;
-    const a = abs(href);
+    const a = abs(el.getAttribute('href'));
     if (!a) return;
     el.setAttribute('data-pnav', a);
-    el.removeAttribute('href');
-    el.style.cursor = 'pointer';
   });
 
-  // intercept form submits
-  doc.querySelectorAll('form[action]').forEach(el => {
-    const a = abs(el.getAttribute('action'));
-    if (a) { el.setAttribute('data-pform', a); el.removeAttribute('action'); }
+  // Mark form actions for the shim
+  doc.querySelectorAll('form').forEach(el => {
+    const raw = el.getAttribute('action') || baseUrl;
+    const a = abs(raw) || baseUrl;
+    el.setAttribute('data-pform', a);
   });
 
-  // inject listener
-  const s = doc.createElement('script');
-  s.textContent = `(function(){
-    document.addEventListener('click',function(e){
-      var el=e.target.closest('[data-pnav]');
-      if(el){e.preventDefault();window.parent.postMessage({type:'rpNav',url:el.getAttribute('data-pnav')},'*');}
-    },true);
-    document.addEventListener('submit',function(e){
-      var f=e.target,a=f.getAttribute('data-pform');
-      if(a){e.preventDefault();
-        var m=(f.method||'get').toLowerCase();
-        if(m==='get'){var q=new URLSearchParams(new FormData(f)).toString();
-          window.parent.postMessage({type:'rpNav',url:a+(q?'?'+q:'')},'*');}
+  // Build the shim — runs before the page's own JS
+  // Intercepts: fetch, XHR, link clicks, form submits, window.open
+  const shim = doc.createElement('script');
+  // baseUrl and worker URL are baked in at rewrite time so the shim is self-contained
+  shim.textContent = `(function(){
+  var W    = ${JSON.stringify(w)};
+  var BASE = ${JSON.stringify(baseUrl)};
+
+  /* Parse the real page URL once so all getters below are fast */
+  var _baseU = new URL(BASE);
+
+  /* Resolve any URL (relative or absolute) through the worker */
+  function px(u) {
+    if (!u || typeof u !== 'string') return u;
+    u = u.trim();
+    if (/^(data:|blob:|javascript:|#|mailto:|tel:)/.test(u)) return u;
+    try {
+      var abs = new URL(u, BASE).href;
+      if (abs.startsWith(W)) return abs;
+      return W + '?url=' + encodeURIComponent(abs);
+    } catch(e) { return u; }
+  }
+
+  /* ── Spoof window.location to return the real page URL ──────────────────────
+     Inside a srcdoc iframe, location.href / location.search etc. return the
+     blob/srcdoc URL. Startpage reads location.search to get the current query
+     before building a new URL — if it reads "" it navigates with no params.
+     We override every location property getter at the prototype level so the
+     page thinks it's running at BASE. */
+  try {
+    var _lp = Object.getPrototypeOf(window.location);
+    var _hd = Object.getOwnPropertyDescriptor(_lp, 'href');
+
+    /* Spoof getters for every useful Location property */
+    var _spoofs = {
+      href:     function() { return BASE; },
+      origin:   function() { return _baseU.origin; },
+      protocol: function() { return _baseU.protocol; },
+      host:     function() { return _baseU.host; },
+      hostname: function() { return _baseU.hostname; },
+      port:     function() { return _baseU.port; },
+      pathname: function() { return _baseU.pathname; },
+      search:   function() { return _baseU.search; },
+      hash:     function() { return _baseU.hash; },
+    };
+    Object.keys(_spoofs).forEach(function(prop) {
+      try {
+        var d = Object.getOwnPropertyDescriptor(_lp, prop) || {};
+        Object.defineProperty(_lp, prop, {
+          get: _spoofs[prop],
+          /* Keep the setter for href so our navigation intercept below works */
+          set: d.set,
+          configurable: true,
+        });
+      } catch(e) {}
+    });
+
+    /* Intercept href setter — navigation via assignment */
+    if (_hd && _hd.set) {
+      Object.defineProperty(_lp, 'href', {
+        get: _spoofs.href,
+        set: function(v) {
+          try {
+            var a = new URL(String(v), BASE).href;
+            if (/^(blob:|about:|data:|javascript:)/.test(a)) { _hd.set.call(this, v); return; }
+            window.parent.postMessage({type:'rpNav', url: a}, '*');
+          } catch(e) { _hd.set.call(this, v); }
+        },
+        configurable: true,
+      });
+    }
+
+    /* Intercept assign() and replace() */
+    var _oa = _lp.assign;
+    _lp.assign = function(v) {
+      try { window.parent.postMessage({type:'rpNav', url: new URL(String(v), BASE).href}, '*'); }
+      catch(e) { _oa && _oa.call(this, v); }
+    };
+    var _or = _lp.replace;
+    _lp.replace = function(v) {
+      try { window.parent.postMessage({type:'rpNav', url: new URL(String(v), BASE).href}, '*'); }
+      catch(e) { _or && _or.call(this, v); }
+    };
+  } catch(e) {}
+
+  /* ── HTMLFormElement.prototype.submit ────────────────────────────────────────
+     Programmatic form.submit() does NOT fire the 'submit' event, so our
+     listener below misses it. Startpage and many sites call form.submit()
+     directly when clicking tab buttons (Images, Video, Shopping…).
+     Overriding the prototype method catches these calls. */
+  try {
+    var _fs = HTMLFormElement.prototype.submit;
+    HTMLFormElement.prototype.submit = function() {
+      var f      = this;
+      var action = f.getAttribute('data-pform') || f.getAttribute('action') || BASE;
+      var method = (f.getAttribute('method') || 'get').toLowerCase();
+      try { action = new URL(action, BASE).href; } catch(e) {}
+      if (method === 'get') {
+        var qs = new URLSearchParams(new FormData(f)).toString();
+        window.parent.postMessage({type:'rpNav', url: action + (qs ? '?' + qs : '')}, '*');
+      } else {
+        var body = new FormData(f);
+        fetch(px(action), {method:'POST', body: body})
+          .then(function(r){ return r.text(); })
+          .then(function(html){
+            window.parent.postMessage({type:'rpHtml', url: action, html: html}, '*');
+          }).catch(function(){});
       }
-    },true);
-  })();`;
-  (doc.head || doc.body).appendChild(s);
+    };
+  } catch(e) {}
+
+  /* ── fetch ── */
+  var _fetch = window.fetch;
+  window.fetch = function(resource, opts) {
+    if (typeof resource === 'string') resource = px(resource);
+    else if (resource && typeof resource === 'object' && resource.url) {
+      try { resource = new Request(px(resource.url), resource); } catch(e){}
+    }
+    return _fetch.call(window, resource, opts);
+  };
+
+  /* ── XMLHttpRequest ── */
+  var _xhrOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(method, url) {
+    var rest = Array.prototype.slice.call(arguments, 2);
+    return _xhrOpen.apply(this, [method, px(url)].concat(rest));
+  };
+
+  /* ── window.open ── */
+  window.open = function(url) {
+    try { window.parent.postMessage({type:'rpNav', url: new URL(url||'', BASE).href}, '*'); }
+    catch(e) {}
+    return null;
+  };
+
+  /* ── history.pushState / replaceState ── */
+  ['pushState','replaceState'].forEach(function(method) {
+    var orig = history[method];
+    history[method] = function(state, title, url) {
+      orig.apply(history, arguments);
+      if (url) {
+        try {
+          /* Update the spoofed BASE so subsequent location reads are correct */
+          _baseU = new URL(url, BASE);
+          BASE   = _baseU.href;
+          window.parent.postMessage({type:'rpUrlChange', url: BASE}, '*');
+        } catch(e) {}
+      }
+    };
+  });
+
+  /* ── Link clicks ── */
+  document.addEventListener('click', function(e) {
+    var el = e.target.closest('a[data-pnav]');
+    if (!el) return;
+    var href = el.getAttribute('data-pnav');
+    if (!href || href.startsWith('#')) return;
+    e.preventDefault();
+    window.parent.postMessage({type:'rpNav', url: href}, '*');
+  }, true);
+
+  /* ── Form submit event (user-triggered submits) ── */
+  document.addEventListener('submit', function(e) {
+    var f      = e.target;
+    var action = f.getAttribute('data-pform') || BASE;
+    e.preventDefault();
+    var method = (f.method || 'get').toLowerCase();
+    if (method === 'get') {
+      var qs = new URLSearchParams(new FormData(f)).toString();
+      window.parent.postMessage({type:'rpNav', url: action + (qs ? '?' + qs : '')}, '*');
+    } else {
+      fetch(px(action), {method:'POST', body: new FormData(f)})
+        .then(function(r){ return r.text(); })
+        .then(function(html){
+          window.parent.postMessage({type:'rpHtml', url: action, html: html}, '*');
+        }).catch(function(){});
+    }
+  }, true);
+
+})();`;
+
+  // Inject shim as the very first child of <head>
+  const head = doc.head || doc.documentElement;
+  head.insertBefore(shim, head.firstChild);
 
   return '<!DOCTYPE html>' + doc.documentElement.outerHTML;
 }
 
-async function browserNavigate(url) {
+/* Resolve raw bar input → full URL or startpage search */
+function resolveInput(raw) {
+  const s = raw.trim();
+  if (!s) return null;
+  if (/^https?:\/\//i.test(s)) return s;
+  if (!s.includes(' ') && /\.\w{2,}/.test(s)) return 'https://' + s;
+  return 'https://www.startpage.com/do/dsearch?query=' + encodeURIComponent(s);
+}
+
+function browserNavigate(url) {
   if (!url) return;
-  if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
-  bState.current = url;
-  $urlBar.value  = url;
+  bState.current   = url;
+  bState.navigating = true;
+  $urlBar.value    = url;
   $welcome.style.display = 'none';
-  bSetLoading(true, 'Loading ' + url + '…');
-  $bStatus.textContent = '';
-  $bStatus.className = 'status';
-  try {
-    const {html, finalUrl} = await smartFetch(url);
-    const rewritten = rewriteForProxy(html, finalUrl);
-    // push history
+  bSetLoading(true);
+
+  // Point the iframe directly at the worker — the worker injects the shim
+  // and rewrites URLs server-side, so location reads inside the page are correct
+  const proxyUrl = state.proxyOn
+    ? state.workerUrl.replace(/\/$/, '') + '?url=' + encodeURIComponent(url)
+    : url;
+
+  $frame.src = proxyUrl;
+
+  if (bState.history[bState.index] !== url) {
+    bState.history = bState.history.slice(0, bState.index + 1);
+    bState.history.push(url);
+    bState.index = bState.history.length - 1;
+  }
+  bUpdateNav();
+}
+
+// Hide loading when the iframe finishes loading
+$frame.addEventListener('load', () => bSetLoading(false));
+
+// Messages from the shim injected by the worker
+window.addEventListener('message', e => {
+  if (!e.data) return;
+  const { type, url } = e.data;
+
+  if (type === 'rpUrl' && url) {
+    // Shim reports the real URL of the page that loaded (handles redirects too)
+    $urlBar.value    = url;
+    bState.current   = url;
+    bSetLoading(false);
+    if (bState.navigating) {
+      // Update the history entry we pushed in browserNavigate with the final URL
+      if (bState.index >= 0) bState.history[bState.index] = url;
+      bState.navigating = false;
+    } else {
+      // Internal navigation (user clicked a link inside the iframe)
+      if (bState.history[bState.index] !== url) {
+        bState.history = bState.history.slice(0, bState.index + 1);
+        bState.history.push(url);
+        bState.index = bState.history.length - 1;
+      }
+    }
+    bUpdateNav();
+
+  } else if (type === 'rpUrlChange' && url) {
+    // SPA pushState/replaceState — content already changed, just sync the bar
+    $urlBar.value  = url;
+    bState.current = url;
     if (bState.history[bState.index] !== url) {
       bState.history = bState.history.slice(0, bState.index + 1);
       bState.history.push(url);
       bState.index = bState.history.length - 1;
+      bUpdateNav();
     }
-    bUpdateNav();
-    $frame.srcdoc = rewritten;
-    bSetLoading(false);
-  } catch(e) {
-    bSetLoading(false);
-    $frame.srcdoc = `<body style="background:#0a0a10;color:#e4e4f0;font-family:monospace;padding:2rem">
-      <h2 style="color:#FF2020">⚠ Failed to load</h2><p>${e.message}</p>
-      <p style="color:#6a6a8a;margin-top:.5rem">Ensure the Proxy toggle is ON and your worker is reachable.</p></body>`;
-    setStatus('browserStatus', '⚠ ' + e.message, 'err');
-  }
-}
 
-// in-iframe link navigation via postMessage
-window.addEventListener('message', e => {
-  if (e.data && e.data.type === 'rpNav' && e.data.url) browserNavigate(e.data.url);
+  } else if (type === 'rpNav' && url) {
+    // Explicit navigation request (fallback — shim now uses navTo directly)
+    browserNavigate(url);
+  }
 });
 
-document.getElementById('btnGo').addEventListener('click', () => browserNavigate($urlBar.value.trim()));
-$urlBar.addEventListener('keydown', e => { if (e.key === 'Enter') browserNavigate($urlBar.value.trim()); });
+document.getElementById('btnGo').addEventListener('click', () => {
+  const resolved = resolveInput($urlBar.value);
+  if (resolved) browserNavigate(resolved);
+});
+$urlBar.addEventListener('keydown', e => {
+  if (e.key === 'Enter') {
+    const resolved = resolveInput($urlBar.value);
+    if (resolved) browserNavigate(resolved);
+  }
+});
 $btnBack.addEventListener('click', () => { if (bState.index > 0) browserNavigate(bState.history[--bState.index]); });
 $btnFwd.addEventListener('click',  () => { if (bState.index < bState.history.length-1) browserNavigate(bState.history[++bState.index]); });
 document.getElementById('btnRefresh').addEventListener('click', () => { if (bState.current) browserNavigate(bState.current); });
 
-// fullscreen
+// fullscreen — native Fullscreen API, CSS class as fallback
 const $shell = document.getElementById('browserShell');
 const $fsBtn  = document.getElementById('btnFullscreen');
-$fsBtn.addEventListener('click', () => {
-  const on = $shell.classList.toggle('fs');
+
+function enterFs() {
+  if ($shell.requestFullscreen) $shell.requestFullscreen().catch(() => cssFallback(true));
+  else if ($shell.webkitRequestFullscreen) $shell.webkitRequestFullscreen();
+  else cssFallback(true);
+}
+function exitFs() {
+  if (document.exitFullscreen && document.fullscreenElement) document.exitFullscreen();
+  else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+  cssFallback(false);
+}
+function cssFallback(on) {
+  $shell.classList.toggle('fs', on);
+  document.body.style.overflow = on ? 'hidden' : '';
+}
+function updateFsBtn(on) {
   $fsBtn.textContent = on ? '✕' : '⛶';
   $fsBtn.title       = on ? 'Exit Fullscreen' : 'Fullscreen';
-  document.body.style.overflow = on ? 'hidden' : '';
+}
+
+$fsBtn.addEventListener('click', () => {
+  const isFs = !!document.fullscreenElement || $shell.classList.contains('fs');
+  isFs ? exitFs() : enterFs();
+  updateFsBtn(!isFs);
+});
+
+// native fullscreen events keep button in sync
+document.addEventListener('fullscreenchange', () => {
+  const on = !!document.fullscreenElement;
+  cssFallback(on);
+  updateFsBtn(on);
 });
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape' && $shell.classList.contains('fs')) {
-    $shell.classList.remove('fs');
-    $fsBtn.textContent = '⛶';
-    document.body.style.overflow = '';
+  if (e.key === 'Escape') {
+    if ($shell.classList.contains('fs')) { cssFallback(false); updateFsBtn(false); }
   }
 });
 
