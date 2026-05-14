@@ -92,7 +92,18 @@ function rwSrcset(v, rw) {
     }).join(', ');
 }
 
-// ── Shim builder ──────────────────────────────────────────────────────────────
+// ── CSS rewriter ─────────────────────────────────────────────────────────────
+
+function rewriteCss(css, target, workerBase) {
+    const rw = makeRw(target, workerBase);
+    return css
+        // url('...') and url("...") and url(...)
+        .replace(/url\(\s*(['"]?)([^'")]+)\s*\)/g, (_, q, url) => `url(${q}${rw(url)}${q})`)
+        // @import 'url' and @import "url"
+        .replace(/@import\s+(['"])([^'"]+)/g, (_, q, url) => `@import ${q}${rw(url)}${q}`);
+}
+
+// ── Shim builder ───────────────────────────────────────────────────────────────
 
 function buildShim(target, workerBase) {
     const W    = JSON.stringify(workerBase);
@@ -121,6 +132,24 @@ function buildShim(target, workerBase) {
             }catch(e){return u;}
         }
 
+        /* Build a fake Location object that always reports the target URL.
+         * Used as a fallback when Location.prototype patching is blocked. */
+        var _fakeLocation={
+            get href()    {return BASE;},     set href(v){navTo(v);},
+            get origin()  {return _bu.origin;},
+            get protocol(){return _bu.protocol;},
+            get host()    {return _bu.host;},
+            get hostname(){return _bu.hostname;},
+            get port()    {return _bu.port;},
+            get pathname(){return _bu.pathname;},
+            get search()  {return _bu.search;},
+            get hash()    {return _bu.hash;},
+            assign:  function(v){navTo(v);},
+            replace: function(v){navTo(v);},
+            reload:  function(){},
+            toString:function(){return BASE;},
+        };
+
         try{
             var _lp=Object.getPrototypeOf(window.location);
             var _hd=Object.getOwnPropertyDescriptor(_lp,'href');
@@ -146,6 +175,11 @@ function buildShim(target, workerBase) {
             _lp.assign =function(v){navTo(v);};
             _lp.replace =function(v){navTo(v);};
         }catch(e){}
+
+        /* Fallback: try to replace window.location and document.location
+         * with our fake object in case the prototype approach failed. */
+        try{ Object.defineProperty(window,   'location',{get:function(){return _fakeLocation;},configurable:true}); }catch(e){}
+        try{ Object.defineProperty(document, 'location',{get:function(){return _fakeLocation;},configurable:true}); }catch(e){}
 
         /* ── Spoof document.* identity properties ───────────────────────────────────
          *  Scripts read these directly instead of window.location, so they bypass
@@ -214,6 +248,44 @@ function buildShim(target, workerBase) {
                 }catch(e){}
             });
         })();
+
+        /* ── HTMLAnchorElement href getter ──────────────────────────────────────────
+         *  Browsers resolve a.href against the REAL document URL, not our spoofed
+         *  document.baseURI. Scripts that do: var a=createElement('a'); a.href='/x';
+         *  then read a.href get back https://proxy/?url=.../x — exposing the proxy.
+         *  Intercept the getter to unwrap any proxy-wrapped value before returning. */
+        try{
+            var _ahd=Object.getOwnPropertyDescriptor(HTMLAnchorElement.prototype,'href');
+            if(_ahd&&_ahd.get){
+                Object.defineProperty(HTMLAnchorElement.prototype,'href',{
+                    get:function(){
+                        var v=_ahd.get.call(this);
+                        try{
+                            var u=new URL(v);
+                            var wb=new URL(W);
+                            if(u.hostname===wb.hostname&&u.pathname.split('/')[1]===wb.pathname.split('/')[1]){
+                                var inner=u.searchParams.get('url');
+                                if(inner) return decodeURIComponent(inner);
+                            }
+                        }catch(e){}
+                        return v;
+                    },
+                    set:_ahd.set,
+                    configurable:true,
+                });
+            }
+        }catch(e){}
+
+        /* ── Disable Google AFS / CSA ad framework ───────────────────────────────────
+         *  AFS reads location data and embeds it in ad request parameters.
+         *  Stubbing out the entry points stops it from constructing those URLs.
+         *  (The scripts are also stripped server-side, but this covers any that
+         *  slip through via dynamic script injection.) */
+        try{
+            var _noop=function(){};
+            window._googCsa=_noop; window.google_csa=_noop;
+            window.googletag=window.googletag||{cmd:[],pubads:function(){return{setTargeting:_noop,enableSingleRequest:_noop,collapseEmptyDivs:_noop,addEventListener:_noop};},enableServices:_noop,display:_noop,defineSlot:function(){return{addService:function(){return this;},setTargeting:function(){return this;}};},destroySlots:_noop};
+        }catch(e){}
 
         /* ── navigator.sendBeacon ────────────────────────────────────────────────────
          *  Beacon calls bypass the fetch/XHR intercepts entirely. */
@@ -385,6 +457,23 @@ function rewriteHtml(html, target, workerBase) {
         if (m) $(el).attr('content', m[1] + rw(m[2]));
     });
 
+    // Rewrite url() inside <style> blocks
+    $('style').each((_, el) => {
+        const t = $(el).html() || '';
+        $(el).html(t.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, (_, q, u) => `url(${q}${rw(u)}${q})`));
+    });
+
+    // Rewrite url() inside inline style attributes
+    $('[style]').each((_, el) => {
+        const t = $(el).attr('style') || '';
+        $(el).attr('style', t.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, (_, q, u) => `url(${q}${rw(u)}${q})`));
+    });
+
+    // Strip Google AFS / ad-detection scripts — they fail to load anyway and
+    // expose the proxy domain via domain_name= parameter construction.
+    // Removing them stops detection without breaking search results.
+    $('script[src*="googleadservices.com"], script[src*="googlesyndication.com"], script[src*="partner.google"], script[src*="doubleclick.net"], script[src*="sodar"]').remove();
+
     return $.html();
 }
 
@@ -462,6 +551,12 @@ app.use(async (req, res, next) => {
     if (ct.includes('text/html')) {
         const html      = await upstream.text();
         const rewritten = rewriteHtml(html, finalTarget, workerBase);
+        return res.send(rewritten);
+    }
+
+    if (ct.includes('text/css')) {
+        const css       = await upstream.text();
+        const rewritten = rewriteCss(css, finalTarget, workerBase);
         return res.send(rewritten);
     }
 
