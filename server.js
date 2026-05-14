@@ -271,29 +271,15 @@ app.use((req, res, next) => {
     next();
 });
 
-// ── Frontend — serve index.html with DEFAULT_WORKER injected ──────────────────
-// Must come BEFORE the proxy middleware so GET / is never treated as a proxy request.
-
-app.get('/', (req, res) => {
-    const workerBase = getWorkerBase(req);
-    // Overwrite DEFAULT_WORKER (whatever URL is hardcoded in the file) with the
-    // correct value for this deployment, including the secret path if set.
-    const html = HTML_TEMPLATE.replace(
-        /const DEFAULT_WORKER\s*=\s*['"][^'"]*['"]/,
-        `const DEFAULT_WORKER = ${JSON.stringify(workerBase)}`
-    );
-    res.setHeader('content-type', 'text/html; charset=utf-8');
-    res.send(html);
-});
-
 // ── Secret gate + HTTP proxy ──────────────────────────────────────────────────
-// Registered as a single middleware so the gate is always checked before the
-// upstream fetch is attempted.
+// MUST come before app.get('/') because Express matches path '/' on any GET
+// request regardless of query string — so GET /?url=... would otherwise hit
+// the index route and return the games site HTML instead of proxying.
 
 app.use(async (req, res, next) => {
     const rawUrl = `http://localhost${req.url}`;
     const target = new URL(rawUrl).searchParams.get('url');
-    if (!target) return next();   // not a proxy request → static files below
+    if (!target) return next();   // no ?url= param → fall through to index/static routes
 
     // ── Secret check ──────────────────────────────────────────────────────────
     if (PROXY_SECRET) {
@@ -355,6 +341,21 @@ app.use(async (req, res, next) => {
     }
 
     Readable.fromWeb(upstream.body).pipe(res);
+});
+
+// ── Frontend — serve index.html with DEFAULT_WORKER injected ──────────────────
+// Registered AFTER the proxy middleware. Guard against ?url= as a belt-and-
+// suspenders measure in case something somehow slips through with path '/'.
+
+app.get('/', (req, res, next) => {
+    if (req.query.url) return next();   // should never happen, but just in case
+    const workerBase = getWorkerBase(req);
+    const html = HTML_TEMPLATE.replace(
+        /const DEFAULT_WORKER\s*=\s*['"][^'"]*['"]/,
+        `const DEFAULT_WORKER = ${JSON.stringify(workerBase)}`
+    );
+    res.setHeader('content-type', 'text/html; charset=utf-8');
+    res.send(html);
 });
 
 // ── Static files ──────────────────────────────────────────────────────────────
