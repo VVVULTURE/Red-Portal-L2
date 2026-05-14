@@ -146,6 +146,30 @@ function buildShim(target, workerBase) {
             _lp.replace =function(v){navTo(v);};
         }catch(e){}
 
+        /* ── Spoof document.URL / documentURI / referrer / domain ──────────────────
+         *  Ad scripts (e.g. Google AFS) read these directly instead of going through
+         *  window.location, so they would otherwise expose the proxy URL. */
+        try{
+            Object.defineProperty(document,'URL',          {get:function(){return BASE;},configurable:true});
+            Object.defineProperty(document,'documentURI',  {get:function(){return BASE;},configurable:true});
+            /* Blank the referrer so the proxy origin isn't sent to ad networks */
+            Object.defineProperty(document,'referrer',     {get:function(){return '';},configurable:true});
+            /* Spoof domain to match the target site */
+            Object.defineProperty(document,'domain',       {get:function(){return _bu.hostname;},configurable:true});
+        }catch(e){}
+
+        /* ── navigator.sendBeacon ────────────────────────────────────────────────────
+         *  Beacon calls bypass the fetch/XHR intercepts. Route them through px() so
+         *  they go through the proxy, preventing the real URL from appearing in the
+         *  beacon payload or the HTTP Referer on the tracking server's side. */
+        if(navigator.sendBeacon){
+            var _sb=navigator.sendBeacon.bind(navigator);
+            navigator.sendBeacon=function(url,data){
+                try{ url=px(url); }catch(e){}
+                return _sb(url,data);
+            };
+        }
+
         var _fe=window.fetch;
         window.fetch=function(r,o){
             if(typeof r==='string') r=px(r);
